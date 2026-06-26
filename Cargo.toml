@@ -21,13 +21,13 @@ path = "src/bin/hasher-cli.rs"
 adler2 = "2.0"
 anyhow = "1.0"
 clap = { version = "4.6", features = ["derive"] }
-eframe = "0.34"
+eframe = "0.35"
 ewf = "0.2.1"
 hex = "0.4"
-md-5 = "0.10"
+md-5 = "0.11"
 rfd = "0.17"
-sha1 = "0.10"
-sha2 = "0.10"
+sha1 = "0.11"
+sha2 = "0.11"
 
 [profile.release]
 lto = "thin"
