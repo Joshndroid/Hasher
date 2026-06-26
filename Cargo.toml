@@ -1,0 +1,35 @@
+[package]
+name = "hasher"
+version = "0.1.0"
+edition = "2024"
+description = "A friendly desktop and command-line hashing calculator"
+license = "AGPL-3.0-only"
+
+[lib]
+name = "hasher"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hasher"
+path = "src/main.rs"
+
+[[bin]]
+name = "hasher-cli"
+path = "src/bin/hasher-cli.rs"
+
+[dependencies]
+adler2 = "2.0"
+anyhow = "1.0"
+clap = { version = "4.6", features = ["derive"] }
+eframe = "0.34"
+ewf = "0.2.1"
+hex = "0.4"
+md-5 = "0.10"
+rfd = "0.17"
+sha1 = "0.10"
+sha2 = "0.10"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

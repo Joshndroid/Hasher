@@ -1,0 +1,73 @@
+name: Windows Defender packaging smoke test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-defender-dry-run:
+    name: Build and Defender-scan Windows artifacts
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: 1.96.0
+          targets: x86_64-pc-windows-msvc
+      - name: Verify Defender and update signatures
+        shell: pwsh
+        run: |
+          $status = Get-MpComputerStatus -ErrorAction Stop
+          $status | Select-Object AMRunningMode,AMServiceEnabled,AntivirusEnabled,RealTimeProtectionEnabled,AMEngineVersion,AntivirusSignatureVersion,AntivirusSignatureLastUpdated | Format-List
+          if (-not $status.AMServiceEnabled) { throw "Microsoft Defender antimalware service is disabled." }
+          if (-not $status.AntivirusEnabled) { throw "Microsoft Defender Antivirus is disabled." }
+          if ($status.AMRunningMode -ne "Normal") { throw "Microsoft Defender is not active: $($status.AMRunningMode)" }
+          $existing = @(Get-MpThreatDetection -ErrorAction Stop)
+          if ($existing.Count -gt 0) { $existing | Format-List; throw "Fresh runner already reports a Defender detection." }
+          Update-MpSignature -ErrorAction Stop
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+      - name: Build all Windows release formats
+        shell: pwsh
+        run: ./packaging/windows/build.ps1
+      - name: Expand archives and scan packages
+        shell: pwsh
+        run: |
+          $scanRoot = Join-Path $PWD "defender-scan"
+          $expanded = Join-Path $scanRoot "expanded"
+          New-Item -ItemType Directory -Path $expanded -Force | Out-Null
+          Copy-Item dist\windows\*.zip,dist\windows\*.exe $scanRoot
+          foreach ($zip in @(Get-ChildItem dist\windows\*.zip)) {
+            Expand-Archive -Path $zip.FullName -DestinationPath (Join-Path $expanded $zip.BaseName) -Force
+          }
+          Start-MpScan -ScanType CustomScan -ScanPath $scanRoot -ErrorAction Stop
+          $detections = @(Get-MpThreatDetection -ErrorAction Stop)
+          if ($detections.Count -gt 0) { $detections | Format-List; throw "Defender detected malware in dry-run artifacts." }
+          $status = Get-MpComputerStatus -ErrorAction Stop
+          @(
+            "Microsoft Defender packaging smoke test: no detections",
+            "Scan time (UTC): $([DateTime]::UtcNow.ToString('O'))",
+            "Engine version: $($status.AMEngineVersion)",
+            "Signature version: $($status.AntivirusSignatureVersion)",
+            "Signatures updated: $($status.AntivirusSignatureLastUpdated)",
+            "",
+            "SHA-256 artifact hashes:"
+          ) | Set-Content dist\windows\defender-smoke-test-report.txt -Encoding UTF8
+          Get-FileHash -Algorithm SHA256 dist\windows\*.zip,dist\windows\*.exe | Sort-Object Path | ForEach-Object { "$($_.Hash.ToLowerInvariant())  $([IO.Path]::GetFileName($_.Path))" } | Add-Content dist\windows\defender-smoke-test-report.txt -Encoding UTF8
+          Get-Content dist\windows\defender-smoke-test-report.txt
+      - name: Upload scanned smoke-test artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: Hasher-Windows-Defender-smoke-test
+          path: |
+            dist/windows/*.zip
+            dist/windows/*.exe
+            dist/windows/defender-smoke-test-report.txt
+          if-no-files-found: error
+          retention-days: 7

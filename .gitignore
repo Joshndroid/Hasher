@@ -1,0 +1,7 @@
+/target/
+/dist/
+*.dmg
+*.zip
+*.exe
+*.msi
+

@@ -1,0 +1,32 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Build Release Package",
+      "type": "shell",
+      "command": "echo",
+      "args": [
+        "Release packaging is only configured for macOS and Windows."
+      ],
+      "windows": {
+        "command": "powershell",
+        "args": [
+          "-NoProfile",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          "${workspaceFolder}\\packaging\\windows\\build.ps1"
+        ]
+      },
+      "osx": {
+        "command": "${workspaceFolder}/packaging/macos/build.sh",
+        "args": []
+      },
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": []
+    }
+  ]
+}
