@@ -1828,24 +1828,6 @@ fn renderer_from_env() -> eframe::Renderer {
         .unwrap_or_default()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn compares_plain_and_prefixed_versions() {
-        assert_eq!(compare_versions("v1.2.3", "1.2.2"), Ordering::Greater);
-        assert_eq!(compare_versions("1.2.3", "v1.2.3"), Ordering::Equal);
-        assert_eq!(compare_versions("1.2.3", "1.3.0"), Ordering::Less);
-    }
-
-    #[test]
-    fn compares_missing_patch_as_zero() {
-        assert_eq!(compare_versions("1.2", "1.2.0"), Ordering::Equal);
-        assert_eq!(compare_versions("1.2.1", "1.2"), Ordering::Greater);
-    }
-}
-
 fn main() -> eframe::Result {
     let custom_chrome = env_flag("HASHER_CUSTOM_CHROME");
     let icon = eframe::icon_data::from_png_bytes(APP_ICON_PNG).ok();
@@ -1874,4 +1856,22 @@ fn main() -> eframe::Result {
             Ok(Box::new(HasherApp::with_custom_chrome(custom_chrome)))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compares_plain_and_prefixed_versions() {
+        assert_eq!(compare_versions("v1.2.3", "1.2.2"), Ordering::Greater);
+        assert_eq!(compare_versions("1.2.3", "v1.2.3"), Ordering::Equal);
+        assert_eq!(compare_versions("1.2.3", "1.3.0"), Ordering::Less);
+    }
+
+    #[test]
+    fn compares_missing_patch_as_zero() {
+        assert_eq!(compare_versions("1.2", "1.2.0"), Ordering::Equal);
+        assert_eq!(compare_versions("1.2.1", "1.2"), Ordering::Greater);
+    }
 }
