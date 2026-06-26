@@ -41,17 +41,17 @@ must contain a literal `{file}` placeholder, for example a command invoking `sig
 with SHA-256 file/timestamp digests and a certificate supplied by the protected runner.
 The build fails if the command fails or the resulting Authenticode signature is invalid.
 If this secret is omitted, Windows artifacts remain unsigned but are still Defender
-scanned, checksummed, and attested.
+scanned and attested.
 
 ## Release and dry-run operation
 
 - Push `vX.Y.Z` to run the gated build and publish only after tests, RustSec, signing,
-  notarization, Defender scanning, checksums, and provenance attestations succeed.
+  notarization, Defender scanning, and provenance attestations succeed.
 - Run **Release or full dry run** manually with an intended `vX.Y.Z` tag to execute the
   same pipeline—including signing, notarization, Defender, and attestations—without
   creating a GitHub Release.
 - The workflow emits a tag-to-tag commit changelog with a GitHub full-diff link.
-- `SHA256SUMS.txt` contains a SHA-256 digest for every published payload and scan report.
+- GitHub displays SHA-256 digests for published release assets.
 - Verify provenance with:
 
   ```sh
@@ -61,4 +61,3 @@ scanned, checksummed, and attested.
 Microsoft Defender scanning fails closed if Defender is disabled, not in Normal mode,
 already reports a detection on the fresh runner, cannot update signatures, or detects
 anything in the installer, archives, or expanded portable contents.
-

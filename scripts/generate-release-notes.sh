@@ -39,13 +39,11 @@ previous_tag="$(git -C "$ROOT_DIR" describe --tags --match 'v[0-9]*.[0-9]*.[0-9]
   echo
   echo "## Verification"
   echo
-  echo "Every downloadable artifact is listed in \`SHA256SUMS.txt\` and receives a GitHub build-provenance attestation."
+  echo "Every downloadable artifact receives a GitHub build-provenance attestation. GitHub shows SHA-256 digests for release assets."
   echo
   echo '```sh'
-  echo "sha256sum --check SHA256SUMS.txt"
   echo "gh attestation verify <artifact> --repo ${GITHUB_REPOSITORY}"
   echo '```'
 } >"$OUTPUT_PATH"
 
 echo "Wrote $OUTPUT_PATH"
-

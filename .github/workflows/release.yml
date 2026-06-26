@@ -245,7 +245,7 @@ jobs:
           retention-days: 14
 
   bundle:
-    name: Changelog and SHA-256 release bundle
+    name: Changelog and release bundle
     needs: [macos, windows, windows-defender-scan]
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -284,19 +284,9 @@ jobs:
           for asset in "${expected[@]}"; do
             [[ -f "release-assets/$asset" ]] || { echo "Missing release artifact: $asset" >&2; exit 1; }
           done
-      - name: Generate tag-to-tag changelog and checksums
+      - name: Generate tag-to-tag changelog
         run: |
           scripts/generate-release-notes.sh release-notes.md "$RELEASE_TAG"
-          scripts/generate-sha256s.sh release-assets release-assets/SHA256SUMS.txt
-          {
-            echo
-            echo "## SHA-256"
-            echo
-            echo '```text'
-            cat release-assets/SHA256SUMS.txt
-            echo '```'
-          } >> release-notes.md
-          cat release-assets/SHA256SUMS.txt
       - name: Upload complete release bundle
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -360,11 +350,10 @@ jobs:
         with:
           name: Hasher-release-bundle
           path: bundle
-      - name: Verify checksums and preview release
+      - name: Preview release
         working-directory: bundle/release-assets
         run: |
-          sha256sum --check SHA256SUMS.txt
-          printf '\nDry run completed every build, signing, notarization, Defender scan, checksum, changelog and attestation stage. No GitHub release was created.\n'
+          printf '\nDry run completed every build, signing, notarization, Defender scan, changelog and attestation stage. No GitHub release was created.\n'
       - name: Upload dry-run preview
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:

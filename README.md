@@ -72,8 +72,8 @@ of a Rust toolchain, VC++ redistributable, or network connection.
 
 The GitHub Actions workflow builds native Apple Silicon macOS and Windows x64
 artifacts. A `vX.Y.Z` tag publishes only after locked tests, Clippy, RustSec,
-Developer ID signing/notarization, Microsoft Defender scanning, SHA-256 generation,
-and GitHub provenance attestations succeed. Manual dispatch runs the same pipeline as a
+Developer ID signing/notarization, Microsoft Defender scanning, and GitHub provenance
+attestations succeed. Manual dispatch runs the same pipeline as a
 dry run without publishing a release. See
 [GitHub release security setup](docs/github-release-security.md) for required repository
 settings and signing secrets.
