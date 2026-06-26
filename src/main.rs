@@ -9,12 +9,15 @@ use hasher::{
     inspect_file, is_ewf_path, read_hash_list,
 };
 use std::{
+    cmp::Ordering,
     fs,
     path::PathBuf,
     sync::mpsc::{self, Receiver},
+    time::Duration,
 };
 
 const APP_ICON_PNG: &[u8] = include_bytes!("../assets/hasher-icon.png");
+const UPDATE_ENDPOINT: &str = "https://api.github.com/repos/fruitmac/Hasher/releases/latest";
 
 #[derive(Clone, Copy, PartialEq)]
 enum Page {
@@ -44,6 +47,27 @@ enum WorkResult {
         Box<anyhow::Result<(Vec<HashResult>, FileInspection)>>,
     ),
     Verified(anyhow::Result<Vec<HashResult>>),
+}
+
+#[derive(Clone)]
+struct UpdateInfo {
+    latest_version: String,
+    release_url: String,
+    is_newer: bool,
+}
+
+enum UpdateState {
+    Idle,
+    Checking,
+    Current(UpdateInfo),
+    Available(UpdateInfo),
+    Failed(String),
+}
+
+#[derive(serde::Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+    html_url: String,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -129,6 +153,66 @@ fn verify_status_line(report: &VerifyReport) -> String {
     }
 }
 
+fn clean_version(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches(['v', 'V'])
+        .trim()
+        .to_owned()
+}
+
+fn version_component(value: &str) -> u64 {
+    value
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .unwrap_or(0)
+}
+
+fn compare_versions(left: &str, right: &str) -> Ordering {
+    let left = clean_version(left);
+    let right = clean_version(right);
+    let mut left_parts = left.split(['.', '-', '+']);
+    let mut right_parts = right.split(['.', '-', '+']);
+    loop {
+        match (left_parts.next(), right_parts.next()) {
+            (None, None) => return Ordering::Equal,
+            (left, right) => {
+                let left = left.map(version_component).unwrap_or(0);
+                let right = right.map(version_component).unwrap_or(0);
+                match left.cmp(&right) {
+                    Ordering::Equal => {}
+                    ordering => return ordering,
+                }
+            }
+        }
+    }
+}
+
+fn check_latest_release() -> anyhow::Result<UpdateInfo> {
+    let release: GitHubRelease = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?
+        .get(UPDATE_ENDPOINT)
+        .header(
+            reqwest::header::USER_AGENT,
+            format!("Hasher/{}", env!("CARGO_PKG_VERSION")),
+        )
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .send()?
+        .error_for_status()?
+        .json()?;
+    let latest_version = clean_version(&release.tag_name);
+    let is_newer =
+        compare_versions(&latest_version, env!("CARGO_PKG_VERSION")) == Ordering::Greater;
+    Ok(UpdateInfo {
+        latest_version,
+        release_url: release.html_url,
+        is_newer,
+    })
+}
+
 /// A resolved set of colours for the current theme. Cheap to copy so it can be
 /// stashed on the app each frame and handed to the free-standing draw helpers.
 #[derive(Clone, Copy)]
@@ -198,6 +282,8 @@ struct HasherApp {
     status: String,
     working: bool,
     receiver: Option<Receiver<WorkResult>>,
+    update_state: UpdateState,
+    update_receiver: Option<Receiver<anyhow::Result<UpdateInfo>>>,
     icon_texture: Option<egui::TextureHandle>,
     /// User-chosen display order for the hash rows, keyed by algorithm so it
     /// survives re-hashing when the text or file changes.
@@ -231,6 +317,8 @@ impl Default for HasherApp {
             status: "Ready".into(),
             working: false,
             receiver: None,
+            update_state: UpdateState::Idle,
+            update_receiver: None,
             icon_texture: None,
             order: Algorithm::ALL.to_vec(),
             reorder_locked: false,
@@ -740,6 +828,46 @@ impl HasherApp {
         }
     }
 
+    fn begin_update_check(&mut self, ctx: egui::Context) {
+        if matches!(self.update_state, UpdateState::Checking) {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.update_state = UpdateState::Checking;
+        self.update_receiver = Some(receiver);
+        self.status = "Checking for updates…".into();
+        std::thread::spawn(move || {
+            let _ = sender.send(check_latest_release());
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_update_check(&mut self) {
+        let message = self
+            .update_receiver
+            .as_ref()
+            .and_then(|receiver| receiver.try_recv().ok());
+        let Some(message) = message else {
+            return;
+        };
+        self.update_receiver = None;
+        match message {
+            Ok(info) if info.is_newer => {
+                self.status = format!("Hasher {} is available", info.latest_version);
+                self.update_state = UpdateState::Available(info);
+            }
+            Ok(info) => {
+                self.status = "Hasher is up to date".into();
+                self.update_state = UpdateState::Current(info);
+            }
+            Err(error) => {
+                let message = format!("{error:#}");
+                self.status = format!("Update check failed: {message}");
+                self.update_state = UpdateState::Failed(message);
+            }
+        }
+    }
+
     fn export_results(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             .set_file_name("hashes.txt")
@@ -1116,6 +1244,7 @@ impl eframe::App for HasherApp {
     fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root_ui.ctx().clone();
         self.poll_work();
+        self.poll_update_check();
         self.apply_appearance(&ctx);
         if self.custom_chrome {
             self.ensure_icon(&ctx);
@@ -1197,6 +1326,9 @@ impl eframe::App for HasherApp {
                     ui.add_space(4.0);
                     if nav_button(pal, ui, self.page == Page::Settings, "Settings") {
                         self.page = Page::Settings;
+                        if matches!(self.update_state, UpdateState::Idle) {
+                            self.begin_update_check(ctx.clone());
+                        }
                     }
                 });
             });
@@ -1589,6 +1721,66 @@ impl HasherApp {
         ui.add_space(8.0);
 
         card(pal, ui, |ui| {
+            ui.label(RichText::new("Updates").size(15.0).strong().color(pal.text));
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Installed").color(pal.text_muted));
+                ui.label(
+                    RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                        .monospace()
+                        .color(pal.text),
+                );
+            });
+            ui.add_space(4.0);
+            match &self.update_state {
+                UpdateState::Idle => {
+                    ui.label(RichText::new("No update check has run yet.").color(pal.text_muted));
+                }
+                UpdateState::Checking => {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().color(pal.accent));
+                        ui.label(RichText::new("Checking GitHub Releases…").color(pal.text_muted));
+                    });
+                }
+                UpdateState::Current(info) => {
+                    ui.label(
+                        RichText::new(format!(
+                            "Up to date. Latest release is v{}.",
+                            info.latest_version
+                        ))
+                        .color(pal.success),
+                    );
+                    ui.hyperlink_to("View latest release", &info.release_url);
+                }
+                UpdateState::Available(info) => {
+                    ui.label(
+                        RichText::new(format!("Update available: v{}", info.latest_version))
+                            .strong()
+                            .color(pal.warn),
+                    );
+                    ui.hyperlink_to("Download release", &info.release_url);
+                }
+                UpdateState::Failed(message) => {
+                    ui.label(RichText::new("Could not check for updates.").color(pal.danger));
+                    ui.add(
+                        egui::Label::new(RichText::new(message).size(12.0).color(pal.text_muted))
+                            .wrap(),
+                    );
+                }
+            }
+            ui.add_space(8.0);
+            let checking = matches!(self.update_state, UpdateState::Checking);
+            if ui
+                .add_enabled(!checking, egui::Button::new("Check now"))
+                .clicked()
+            {
+                self.begin_update_check(ui.ctx().clone());
+            }
+        });
+
+        ui.add_space(8.0);
+
+        card(pal, ui, |ui| {
             ui.label(RichText::new("About").size(15.0).strong().color(pal.text));
             ui.add_space(6.0);
             ui.horizontal(|ui| {
@@ -1634,6 +1826,24 @@ fn renderer_from_env() -> eframe::Renderer {
     renderer
         .and_then(|value| value.parse().ok())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compares_plain_and_prefixed_versions() {
+        assert_eq!(compare_versions("v1.2.3", "1.2.2"), Ordering::Greater);
+        assert_eq!(compare_versions("1.2.3", "v1.2.3"), Ordering::Equal);
+        assert_eq!(compare_versions("1.2.3", "1.3.0"), Ordering::Less);
+    }
+
+    #[test]
+    fn compares_missing_patch_as_zero() {
+        assert_eq!(compare_versions("1.2", "1.2.0"), Ordering::Equal);
+        assert_eq!(compare_versions("1.2.1", "1.2"), Ordering::Greater);
+    }
 }
 
 fn main() -> eframe::Result {

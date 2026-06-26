@@ -26,6 +26,8 @@ ewf = "0.2.1"
 hex = "0.4"
 md-5 = "0.11"
 rfd = "0.17"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
 sha1 = "0.11"
 sha2 = "0.11"
 

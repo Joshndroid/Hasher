@@ -6,7 +6,6 @@ $Dist = "$Root\dist\windows"
 Set-Location $Root
 cargo build --release --bins --locked
 if (Test-Path $Dist) { Remove-Item -Recurse -Force $Dist }
-New-Item -ItemType Directory -Force "$Dist\Hasher-portable" | Out-Null
 New-Item -ItemType Directory -Force "$Dist\Hasher-offline-portable" | Out-Null
 
 function Invoke-HasherOptionalSigning([string]$Path) {
@@ -27,9 +26,7 @@ function Invoke-HasherOptionalSigning([string]$Path) {
 Invoke-HasherOptionalSigning "target\release\hasher.exe"
 Invoke-HasherOptionalSigning "target\release\hasher-cli.exe"
 
-Copy-Item target\release\hasher.exe,target\release\hasher-cli.exe,README.md,LICENSE,assets\OFL.txt,assets\hasher-icon.ico "$Dist\Hasher-portable"
 Copy-Item target\release\hasher.exe,target\release\hasher-cli.exe,README.md,LICENSE,assets\OFL.txt,assets\hasher-icon.ico "$Dist\Hasher-offline-portable"
-Compress-Archive -Force "$Dist\Hasher-portable\*" "$Dist\Hasher-$Version-windows-portable.zip"
 Compress-Archive -Force "$Dist\Hasher-offline-portable\*" "$Dist\Hasher-$Version-windows-offline-portable.zip"
 
 function Resolve-Iscc {

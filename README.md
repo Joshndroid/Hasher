@@ -55,9 +55,9 @@ chmod +x packaging/macos/build.sh
 packaging/macos/build.sh
 ```
 
-This creates an ad-hoc-signed `.app`, DMG, app ZIP, and portable GUI/CLI ZIP in
-`dist/macos`. Distribution outside your own machines should add a Developer ID
-signature and Apple notarisation.
+This creates an ad-hoc-signed `.app`, drag-to-Applications DMG, and
+Installer.app PKG in `dist/macos`. Distribution outside your own machines should
+add a Developer ID signature and Apple notarisation.
 
 On Windows PowerShell:
 
@@ -65,8 +65,8 @@ On Windows PowerShell:
 .\packaging\windows\build.ps1
 ```
 
-This creates portable and offline-portable ZIPs in `dist/windows`. If Inno Setup
-6 is installed and `ISCC.exe` is on `PATH`, it also creates the Windows installer.
+This creates an offline-portable ZIP in `dist/windows`. If Inno Setup 6 is
+installed and `ISCC.exe` is on `PATH`, it also creates the Windows installer.
 The embedded font and statically linked CRT make the offline package independent
 of a Rust toolchain, VC++ redistributable, or network connection.
 
