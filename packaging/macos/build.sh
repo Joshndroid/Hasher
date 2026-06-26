@@ -30,12 +30,15 @@ fi
 CODESIGN_IDENTITY="${CODESIGN_IDENTITY:--}"
 if [[ "$CODESIGN_IDENTITY" == "-" ]]; then
   codesign --force --sign - "$APP/Contents/MacOS/hasher"
+  codesign --force --sign - "$BINDIR/hasher-cli"
   codesign --force --deep --sign - "$APP"
 else
   codesign --force --options runtime --timestamp --sign "$CODESIGN_IDENTITY" "$APP/Contents/MacOS/hasher"
+  codesign --force --options runtime --timestamp --sign "$CODESIGN_IDENTITY" "$BINDIR/hasher-cli"
   codesign --force --deep --options runtime --timestamp --sign "$CODESIGN_IDENTITY" "$APP"
 fi
 codesign --verify --deep --strict --verbose=2 "$APP"
+codesign --verify --strict --verbose=2 "$BINDIR/hasher-cli"
 if command -v xattr >/dev/null; then
   xattr -cr "$APP"
   codesign --verify --deep --strict --verbose=2 "$APP"
@@ -52,6 +55,19 @@ if [[ "${NOTARIZE:-0}" == "1" ]]; then
   rm -f "$NOTARY_ZIP"
 fi
 
+APP_ZIP="$DIST/Hasher-${VERSION}-macOS-${ARCH}.zip"
+PORTABLE_DIR="$DIST/Hasher-${VERSION}-macOS-${ARCH}-portable"
+PORTABLE_ZIP="$DIST/Hasher-${VERSION}-macOS-${ARCH}-portable.zip"
+rm -f "$APP_ZIP" "$PORTABLE_ZIP"
+rm -rf "$PORTABLE_DIR"
+ditto -c -k --sequesterRsrc --keepParent "$APP" "$APP_ZIP"
+mkdir -p "$PORTABLE_DIR"
+ditto "$APP" "$PORTABLE_DIR/Hasher.app"
+cp "$BINDIR/hasher-cli" README.md LICENSE assets/OFL.txt "$PORTABLE_DIR/"
+mv "$PORTABLE_DIR/OFL.txt" "$PORTABLE_DIR/JetBrainsMono-OFL.txt"
+ditto -c -k --sequesterRsrc --keepParent "$PORTABLE_DIR" "$PORTABLE_ZIP"
+rm -rf "$PORTABLE_DIR"
+
 if command -v pkgbuild >/dev/null; then
   PKG="$DIST/Hasher-${VERSION}-macOS-${ARCH}.pkg"
   PKG_SIGN_IDENTITY="${PKG_SIGN_IDENTITY:-}"
@@ -60,9 +76,11 @@ if command -v pkgbuild >/dev/null; then
   else
     pkgbuild --component "$APP" --install-location /Applications "$PKG"
   fi
-  if [[ "${NOTARIZE:-0}" == "1" ]]; then
+  if [[ "${NOTARIZE:-0}" == "1" && -n "$PKG_SIGN_IDENTITY" ]]; then
     xcrun notarytool submit "$PKG" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
     xcrun stapler staple "$PKG"
+  elif [[ "${NOTARIZE:-0}" == "1" ]]; then
+    echo "Skipping PKG notarization because PKG_SIGN_IDENTITY is not set."
   fi
 fi
 

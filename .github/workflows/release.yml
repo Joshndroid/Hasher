@@ -181,7 +181,6 @@ jobs:
         with:
           name: Hasher-Windows-x64
           path: |
-            dist/windows/Hasher-*-windows-portable.zip
             dist/windows/Hasher-*-windows-offline-portable.zip
             dist/windows/Hasher-*-setup.exe
           if-no-files-found: error
@@ -217,7 +216,9 @@ jobs:
           New-Item -ItemType Directory -Path $expanded -Force | Out-Null
           Copy-Item defender-input\* $scanRoot
           $zips = @(Get-ChildItem defender-input\*.zip)
-          if ($zips.Count -ne 2) { throw "Expected two Windows ZIP artifacts, found $($zips.Count)." }
+          $exes = @(Get-ChildItem defender-input\*.exe)
+          if ($zips.Count -lt 1) { throw "Expected at least one Windows ZIP artifact, found $($zips.Count)." }
+          if ($exes.Count -lt 1) { throw "Expected at least one Windows EXE artifact, found $($exes.Count)." }
           foreach ($zip in $zips) {
             Expand-Archive -Path $zip.FullName -DestinationPath (Join-Path $expanded $zip.BaseName) -Force
           }
@@ -276,7 +277,6 @@ jobs:
             "Hasher-${version}-macOS-arm64.zip"
             "Hasher-${version}-macOS-arm64-portable.zip"
             "Hasher-${version}-macOS-arm64.dmg"
-            "Hasher-${version}-windows-portable.zip"
             "Hasher-${version}-windows-offline-portable.zip"
             "Hasher-${version}-setup.exe"
             "defender-scan-report.txt"
