@@ -70,8 +70,8 @@ This creates portable and offline-portable ZIPs in `dist/windows`. If Inno Setup
 The embedded font and statically linked CRT make the offline package independent
 of a Rust toolchain, VC++ redistributable, or network connection.
 
-The GitHub Actions workflow builds native Apple Silicon, Intel macOS, and Windows
-x64 artifacts. A `vX.Y.Z` tag publishes only after locked tests, Clippy, RustSec,
+The GitHub Actions workflow builds native Apple Silicon macOS and Windows x64
+artifacts. A `vX.Y.Z` tag publishes only after locked tests, Clippy, RustSec,
 Developer ID signing/notarization, Microsoft Defender scanning, SHA-256 generation,
 and GitHub provenance attestations succeed. Manual dispatch runs the same pipeline as a
 dry run without publishing a release. See

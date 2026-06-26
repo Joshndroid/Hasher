@@ -6,8 +6,7 @@ VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)"
 TARGET="${TARGET:-$(rustc -vV | sed -n 's/^host: //p')}"
 case "$TARGET" in
   aarch64-apple-darwin) ARCH="arm64" ;;
-  x86_64-apple-darwin) ARCH="x64" ;;
-  *) echo "Unsupported macOS target: $TARGET" >&2; exit 1 ;;
+  *) echo "Unsupported macOS target: $TARGET; only Apple Silicon is packaged." >&2; exit 1 ;;
 esac
 DIST="$ROOT/dist/macos"
 APP="$DIST/Hasher.app"
