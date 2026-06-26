@@ -41,7 +41,7 @@ enum WorkResult {
     Hashed(
         PathBuf,
         FileHashMode,
-        anyhow::Result<(Vec<HashResult>, FileInspection)>,
+        Box<anyhow::Result<(Vec<HashResult>, FileInspection)>>,
     ),
     Verified(anyhow::Result<Vec<HashResult>>),
 }
@@ -665,7 +665,7 @@ impl HasherApp {
                 FileHashMode::ContainerFile => hash_file(&path)
                     .and_then(|hashes| inspect_file(&path).map(|info| (hashes, info))),
             };
-            let _ = sender.send(WorkResult::Hashed(path, mode, result));
+            let _ = sender.send(WorkResult::Hashed(path, mode, Box::new(result)));
             ctx.request_repaint();
         });
     }
@@ -707,7 +707,7 @@ impl HasherApp {
         match message {
             WorkResult::Hashed(path, mode, result) => {
                 self.working = false;
-                match result {
+                match *result {
                     Ok((hashes, info)) => {
                         self.results = hashes;
                         self.inspection = Some(info);
@@ -840,24 +840,24 @@ impl HasherApp {
             };
 
             // Draw an insertion line and capture a drop while something is hovering.
-            if let Some(response) = response {
-                if let (Some(pointer), Some(_payload)) = (
+            if let Some(response) = response
+                && let (Some(pointer), Some(_payload)) = (
                     ui.input(|i| i.pointer.interact_pos()),
                     response.dnd_hover_payload::<usize>(),
-                ) {
-                    let rect = response.rect;
-                    let stroke = Stroke::new(2.0, pal.accent);
-                    let insert = if pointer.y < rect.center().y {
-                        ui.painter().hline(rect.x_range(), rect.top(), stroke);
-                        idx
-                    } else {
-                        ui.painter().hline(rect.x_range(), rect.bottom(), stroke);
-                        idx + 1
-                    };
-                    if let Some(dragged) = response.dnd_release_payload::<usize>() {
-                        drag_from = Some(*dragged);
-                        drop_to = Some(insert);
-                    }
+                )
+            {
+                let rect = response.rect;
+                let stroke = Stroke::new(2.0, pal.accent);
+                let insert = if pointer.y < rect.center().y {
+                    ui.painter().hline(rect.x_range(), rect.top(), stroke);
+                    idx
+                } else {
+                    ui.painter().hline(rect.x_range(), rect.bottom(), stroke);
+                    idx + 1
+                };
+                if let Some(dragged) = response.dnd_release_payload::<usize>() {
+                    drag_from = Some(*dragged);
+                    drop_to = Some(insert);
                 }
             }
 
@@ -1145,12 +1145,12 @@ impl eframe::App for HasherApp {
         }
 
         if self.custom_chrome {
-            egui::Panel::top("header").show_inside(root_ui, |ui| {
+            egui::Panel::top("header").show(root_ui, |ui| {
                 self.title_bar(ui);
             });
         }
 
-        egui::Panel::bottom("status").show_inside(root_ui, |ui| {
+        egui::Panel::bottom("status").show(root_ui, |ui| {
             ui.add_space(3.0);
             ui.horizontal(|ui| {
                 ui.add_space(4.0);
@@ -1179,7 +1179,7 @@ impl eframe::App for HasherApp {
         egui::Panel::left("navigation")
             .resizable(false)
             .default_size(148.0)
-            .show_inside(root_ui, |ui| {
+            .show(root_ui, |ui| {
                 ui.add_space(8.0);
 
                 if nav_button(pal, ui, self.page == Page::Text, "Text & Numbers") {
@@ -1201,7 +1201,7 @@ impl eframe::App for HasherApp {
                 });
             });
 
-        egui::CentralPanel::default().show_inside(root_ui, |ui| {
+        egui::CentralPanel::default().show(root_ui, |ui| {
             egui::ScrollArea::vertical()
                 .auto_shrink([false; 2])
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
