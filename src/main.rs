@@ -1625,8 +1625,13 @@ fn env_flag(name: &str) -> bool {
 }
 
 fn renderer_from_env() -> eframe::Renderer {
-    std::env::var("HASHER_RENDERER")
-        .ok()
+    let renderer = if env_flag("HASHER_SOFTWARE_RENDERER") {
+        Some("glow".to_owned())
+    } else {
+        std::env::var("HASHER_RENDERER").ok()
+    };
+
+    renderer
         .and_then(|value| value.parse().ok())
         .unwrap_or_default()
 }
@@ -1648,11 +1653,6 @@ fn main() -> eframe::Result {
             }
         },
         renderer: renderer_from_env(),
-        hardware_acceleration: if env_flag("HASHER_SOFTWARE_RENDERER") {
-            eframe::HardwareAcceleration::Off
-        } else {
-            eframe::HardwareAcceleration::Preferred
-        },
         ..Default::default()
     };
     eframe::run_native(
