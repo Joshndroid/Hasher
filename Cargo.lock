@@ -1676,7 +1676,7 @@ dependencies = [
 
 [[package]]
 name = "hasher"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "adler2",
  "anyhow",
