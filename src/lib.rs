@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Algorithm {
     Adler32,
     Md5,
@@ -138,6 +138,74 @@ pub fn format_results(results: &[HashResult]) -> String {
         .map(|r| format!("{}  {}", r.algorithm, r.value))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VerifyOutcome {
+    Match,
+    Mismatch,
+    Invalid,
+}
+
+#[derive(Clone, Debug)]
+pub struct VerifyReport {
+    pub outcome: VerifyOutcome,
+    pub algorithm: Option<Algorithm>,
+    pub expected: String,
+    pub computed: Option<String>,
+    pub note: String,
+}
+
+/// Normalise an expected-hash string (drop whitespace and `:` separators,
+/// lower-case it), pick the algorithm by length, and compare against the
+/// computed set.
+pub fn build_report(expected_raw: &str, computed_set: &[HashResult]) -> VerifyReport {
+    let expected: String = expected_raw
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != ':')
+        .collect::<String>()
+        .to_ascii_lowercase();
+
+    let mut report = VerifyReport {
+        outcome: VerifyOutcome::Invalid,
+        algorithm: None,
+        expected: expected.clone(),
+        computed: None,
+        note: String::new(),
+    };
+
+    if expected.is_empty() {
+        report.note = "Enter or import a hash value to verify against.".into();
+        return report;
+    }
+    if !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
+        report.note = "The expected value contains non-hexadecimal characters.".into();
+        return report;
+    }
+
+    let Some(algorithm) = Algorithm::ALL
+        .into_iter()
+        .find(|a| a.hex_len() == expected.len())
+    else {
+        report.note = format!(
+            "{} hex characters doesn't match ADLER32 (8), MD5 (32), SHA-1 (40) or SHA-256 (64).",
+            expected.len()
+        );
+        return report;
+    };
+    report.algorithm = Some(algorithm);
+
+    let computed = computed_set
+        .iter()
+        .find(|r| r.algorithm == algorithm)
+        .map(|r| r.value.clone());
+    match &computed {
+        Some(value) if *value == expected => report.outcome = VerifyOutcome::Match,
+        Some(_) => report.outcome = VerifyOutcome::Mismatch,
+        None => report.note = "Could not compute this algorithm for the given input.".into(),
+    }
+    report.computed = computed;
+    report
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -376,19 +444,21 @@ fn count_segments(path: &Path, kind: EvidenceKind) -> usize {
         .flatten()
         .filter(|entry| {
             let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            let candidate = Path::new(&name);
+            let ext = candidate.extension().and_then(|s| s.to_str()).unwrap_or("");
+            let stem = candidate.file_stem().and_then(|s| s.to_str()).unwrap_or("");
             if kind == EvidenceKind::ExpertWitness {
-                name.starts_with(&prefix)
-                    && name.rsplit('.').next().is_some_and(|e| {
-                        matches!(e.chars().next(), Some('e' | 'l'))
-                            && e.len() >= 3
-                            && e[1..].chars().all(|c| c.is_ascii_alphanumeric())
-                    })
+                // Match siblings of the exact same base name, e.g. `disk.E01`,
+                // `disk.E02`, not unrelated files that merely share a prefix.
+                stem == prefix
+                    && matches!(ext.chars().next(), Some('e' | 'l'))
+                    && ext.len() >= 3
+                    && ext.chars().all(|c| c.is_ascii_alphanumeric())
             } else {
-                name.starts_with(&prefix)
-                    && name
-                        .rsplit('.')
-                        .next()
-                        .is_some_and(|e| e.len() == 3 && e.chars().all(|c| c.is_ascii_digit()))
+                let entry_prefix = stem.trim_end_matches(|c: char| c.is_ascii_digit());
+                entry_prefix == prefix
+                    && ext.len() == 3
+                    && ext.chars().all(|c| c.is_ascii_digit())
             }
         })
         .count()
@@ -457,5 +527,51 @@ mod tests {
         let hashes = extract_hashes("MD5: 900150983CD24FB0D6963F7D28E17F72");
         assert_eq!(hashes[0].algorithm, Algorithm::Md5);
         assert_eq!(hashes[0].value, "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    #[test]
+    fn eight_hex_tokens_are_read_as_adler32() {
+        // Any 8-character hex word is ambiguous and parses as ADLER32.
+        let hashes = extract_hashes("deadbeef and cafef00d");
+        assert_eq!(hashes.len(), 2);
+        assert!(hashes.iter().all(|h| h.algorithm == Algorithm::Adler32));
+    }
+
+    #[test]
+    fn unrecognised_lengths_are_ignored() {
+        // 16 hex chars matches no supported algorithm.
+        assert!(extract_hashes("0123456789abcdef").is_empty());
+    }
+
+    #[test]
+    fn build_report_matches_and_mismatches() {
+        let computed = hash_bytes(b"abc");
+        let md5 = "900150983cd24fb0d6963f7d28e17f72";
+
+        let good = build_report(md5, &computed);
+        assert_eq!(good.outcome, VerifyOutcome::Match);
+        assert_eq!(good.algorithm, Some(Algorithm::Md5));
+
+        // Whitespace and `:` separators are tolerated, case-insensitively.
+        let spaced = build_report("MD5: 90015098 3CD24FB0 D6963F7D 28E17F72", &computed);
+        assert_eq!(spaced.outcome, VerifyOutcome::Mismatch);
+
+        let mismatch = build_report(&"0".repeat(32), &computed);
+        assert_eq!(mismatch.outcome, VerifyOutcome::Mismatch);
+    }
+
+    #[test]
+    fn build_report_rejects_bad_input() {
+        let computed = hash_bytes(b"abc");
+        assert_eq!(build_report("", &computed).outcome, VerifyOutcome::Invalid);
+        assert_eq!(
+            build_report("xyz123", &computed).outcome,
+            VerifyOutcome::Invalid
+        );
+        // Right characters, wrong length.
+        assert_eq!(
+            build_report("abcd", &computed).outcome,
+            VerifyOutcome::Invalid
+        );
     }
 }

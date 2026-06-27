@@ -1,9 +1,10 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use hasher::{
-    Algorithm, format_results, hash_bytes, hash_ewf_media, hash_file, inspect_file, read_hash_list,
+    Algorithm, VerifyOutcome, build_report, format_results, hash_bytes, hash_ewf_media, hash_file,
+    inspect_file, is_ewf_path, read_hash_list,
 };
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, process::ExitCode};
 
 #[derive(Parser)]
 #[command(
@@ -44,6 +45,18 @@ enum Command {
     Read { path: PathBuf },
     /// Identify a forensic image/container and discover sidecar hashes.
     Inspect { path: PathBuf },
+    /// Compare an expected hash against a file or text. Exits 1 on mismatch,
+    /// 2 when the expected value or input is unusable.
+    Verify {
+        /// The trusted hash to check against (ADLER32, MD5, SHA-1 or SHA-256).
+        expected: String,
+        /// Hash this file (raw or EWF/E01) and compare.
+        #[arg(short, long, conflicts_with = "text")]
+        file: Option<PathBuf>,
+        /// Hash this exact UTF-8 text and compare.
+        #[arg(short, long)]
+        text: Option<String>,
+    },
 }
 
 fn selected(results: Vec<hasher::HashResult>, algorithm: &str) -> Result<Vec<hasher::HashResult>> {
@@ -71,13 +84,58 @@ fn emit(rendered: &str, output: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn main() -> Result<()> {
+fn run_verify(expected: &str, file: Option<PathBuf>, text: Option<String>) -> Result<ExitCode> {
+    let computed = match (file, text) {
+        (Some(path), _) => {
+            if is_ewf_path(&path) {
+                hash_ewf_media(&path)?.results
+            } else {
+                hash_file(&path)?
+            }
+        }
+        (None, Some(text)) => hash_bytes(text.as_bytes()),
+        (None, None) => bail!("provide --file <PATH> or --text <STRING> to hash"),
+    };
+    let report = build_report(expected, &computed);
+    let algorithm = report
+        .algorithm
+        .map(|a| a.to_string())
+        .unwrap_or_default();
+    match report.outcome {
+        VerifyOutcome::Match => {
+            println!("MATCH {algorithm} {}", report.expected);
+            Ok(ExitCode::SUCCESS)
+        }
+        VerifyOutcome::Mismatch => {
+            println!("MISMATCH {algorithm}");
+            println!("expected {}", report.expected);
+            if let Some(computed) = report.computed {
+                println!("computed {computed}");
+            }
+            Ok(ExitCode::from(1))
+        }
+        VerifyOutcome::Invalid => {
+            let note = if report.note.is_empty() {
+                "could not verify the supplied value"
+            } else {
+                &report.note
+            };
+            eprintln!("{note}");
+            Ok(ExitCode::from(2))
+        }
+    }
+}
+
+fn main() -> Result<ExitCode> {
     let cli = Cli::parse();
-    match cli.command {
-        Command::Text { value, algorithm } => println!(
-            "{}",
-            format_results(&selected(hash_bytes(value.as_bytes()), &algorithm)?)
-        ),
+    let code = match cli.command {
+        Command::Text { value, algorithm } => {
+            println!(
+                "{}",
+                format_results(&selected(hash_bytes(value.as_bytes()), &algorithm)?)
+            );
+            ExitCode::SUCCESS
+        }
         Command::File {
             path,
             algorithm,
@@ -85,6 +143,7 @@ fn main() -> Result<()> {
         } => {
             let rendered = format_results(&selected(hash_file(&path)?, &algorithm)?);
             emit(&rendered, output)?;
+            ExitCode::SUCCESS
         }
         Command::Ewf {
             path,
@@ -110,8 +169,12 @@ fn main() -> Result<()> {
             }
             let rendered = format_results(&selected(analysis.results, &algorithm)?);
             emit(&rendered, output)?;
+            ExitCode::SUCCESS
         }
-        Command::Read { path } => println!("{}", format_results(&read_hash_list(path)?)),
+        Command::Read { path } => {
+            println!("{}", format_results(&read_hash_list(path)?));
+            ExitCode::SUCCESS
+        }
         Command::Inspect { path } => {
             let info = inspect_file(path)?;
             println!(
@@ -136,7 +199,13 @@ fn main() -> Result<()> {
                     println!("{name}: {value}");
                 }
             }
+            ExitCode::SUCCESS
         }
-    }
-    Ok(())
+        Command::Verify {
+            expected,
+            file,
+            text,
+        } => run_verify(&expected, file, text)?,
+    };
+    Ok(code)
 }

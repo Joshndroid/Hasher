@@ -2,11 +2,13 @@
 
 use eframe::egui::{
     self, Align, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Frame,
-    Layout, Margin, RichText, Shadow, Stroke, Theme, ThemePreference, Vec2, Visuals,
+    Layout, Margin, RichText, Shadow, Stroke, Theme, ThemePreference, Vec2, Visuals, WidgetInfo,
+    WidgetType,
 };
 use hasher::{
-    Algorithm, FileInspection, HashResult, format_results, hash_bytes, hash_ewf_media, hash_file,
-    inspect_file, is_ewf_path, read_hash_list,
+    Algorithm, FileInspection, HashResult, VerifyOutcome, VerifyReport, build_report,
+    format_results, hash_bytes, hash_ewf_media, hash_file, inspect_file, is_ewf_path,
+    read_hash_list,
 };
 use std::{
     cmp::Ordering,
@@ -27,11 +29,20 @@ enum Page {
     Settings,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 enum ThemeChoice {
     System,
     Dark,
     Light,
+}
+
+/// Settings restored from disk between runs via eframe's storage.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedSettings {
+    theme: ThemeChoice,
+    accent: [u8; 4],
+    order: Vec<Algorithm>,
+    reorder_locked: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -80,74 +91,6 @@ struct GitHubRelease {
 enum VerifyInput {
     Text,
     File,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum VerifyOutcome {
-    Match,
-    Mismatch,
-    Invalid,
-}
-
-#[derive(Clone)]
-struct VerifyReport {
-    outcome: VerifyOutcome,
-    algorithm: Option<Algorithm>,
-    expected: String,
-    computed: Option<String>,
-    note: String,
-}
-
-/// Normalise an expected-hash string (drop whitespace and `:` separators,
-/// lower-case it), pick the algorithm by length, and compare against the
-/// computed set.
-fn build_report(expected_raw: &str, computed_set: &[HashResult]) -> VerifyReport {
-    let expected: String = expected_raw
-        .chars()
-        .filter(|c| !c.is_whitespace() && *c != ':')
-        .collect::<String>()
-        .to_ascii_lowercase();
-
-    let mut report = VerifyReport {
-        outcome: VerifyOutcome::Invalid,
-        algorithm: None,
-        expected: expected.clone(),
-        computed: None,
-        note: String::new(),
-    };
-
-    if expected.is_empty() {
-        report.note = "Enter or import a hash value to verify against.".into();
-        return report;
-    }
-    if !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
-        report.note = "The expected value contains non-hexadecimal characters.".into();
-        return report;
-    }
-
-    let Some(algorithm) = Algorithm::ALL
-        .into_iter()
-        .find(|a| a.hex_len() == expected.len())
-    else {
-        report.note = format!(
-            "{} hex characters doesn't match ADLER32 (8), MD5 (32), SHA-1 (40) or SHA-256 (64).",
-            expected.len()
-        );
-        return report;
-    };
-    report.algorithm = Some(algorithm);
-
-    let computed = computed_set
-        .iter()
-        .find(|r| r.algorithm == algorithm)
-        .map(|r| r.value.clone());
-    match &computed {
-        Some(value) if *value == expected => report.outcome = VerifyOutcome::Match,
-        Some(_) => report.outcome = VerifyOutcome::Mismatch,
-        None => report.note = "Could not compute this algorithm for the given input.".into(),
-    }
-    report.computed = computed;
-    report
 }
 
 fn verify_status_line(report: &VerifyReport) -> String {
@@ -268,6 +211,35 @@ fn palette(dark: bool, accent: Color32) -> Palette {
     }
 }
 
+/// sRGB channel to linear, per WCAG relative-luminance.
+fn linear_channel(value: u8) -> f32 {
+    let c = value as f32 / 255.0;
+    if c <= 0.03928 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn relative_luminance(color: Color32) -> f32 {
+    0.2126 * linear_channel(color.r())
+        + 0.7152 * linear_channel(color.g())
+        + 0.0722 * linear_channel(color.b())
+}
+
+/// WCAG contrast ratio between two colours (1.0 = identical, 21.0 = max).
+fn contrast_ratio(a: Color32, b: Color32) -> f32 {
+    let (l1, l2) = (relative_luminance(a), relative_luminance(b));
+    let (hi, lo) = if l1 >= l2 { (l1, l2) } else { (l2, l1) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// One file's result inside a multi-file batch.
+struct BatchEntry {
+    path: PathBuf,
+    result: anyhow::Result<Vec<HashResult>>,
+}
+
 struct HasherApp {
     custom_chrome: bool,
     page: Page,
@@ -276,10 +248,16 @@ struct HasherApp {
     pal: Palette,
     text: String,
     file_path: String,
+    /// Cached EWF detection for the current `file_path`, so the File page does
+    /// not re-open the file from disk on every frame.
+    file_is_ewf: bool,
     results: Vec<HashResult>,
     results_source: Option<ResultSource>,
     inspection: Option<FileInspection>,
     file_hash_mode: FileHashMode,
+    /// Per-file results when several files are hashed at once.
+    batch: Vec<BatchEntry>,
+    batch_pending: usize,
     verify_expected: String,
     verify_input: VerifyInput,
     verify_text: String,
@@ -288,7 +266,9 @@ struct HasherApp {
     verifying: bool,
     status: String,
     working: bool,
-    receiver: Option<Receiver<WorkResult>>,
+    file_receiver: Option<Receiver<WorkResult>>,
+    verify_receiver: Option<Receiver<WorkResult>>,
+    batch_receiver: Option<Receiver<(PathBuf, Box<anyhow::Result<Vec<HashResult>>>)>>,
     update_state: UpdateState,
     update_receiver: Option<Receiver<anyhow::Result<UpdateInfo>>>,
     icon_texture: Option<egui::TextureHandle>,
@@ -313,10 +293,13 @@ impl Default for HasherApp {
             pal: palette(true, accent),
             text: String::new(),
             file_path: String::new(),
+            file_is_ewf: false,
             results: Vec::new(),
             results_source: None,
             inspection: None,
             file_hash_mode: FileHashMode::ContainerFile,
+            batch: Vec::new(),
+            batch_pending: 0,
             verify_expected: String::new(),
             verify_input: VerifyInput::Text,
             verify_text: String::new(),
@@ -325,7 +308,9 @@ impl Default for HasherApp {
             verifying: false,
             status: "Ready".into(),
             working: false,
-            receiver: None,
+            file_receiver: None,
+            verify_receiver: None,
+            batch_receiver: None,
             update_state: UpdateState::Idle,
             update_receiver: None,
             icon_texture: None,
@@ -408,6 +393,7 @@ fn nav_button(pal: Palette, ui: &mut egui::Ui, selected: bool, label: &str) -> b
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
+    response.widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, true, selected, label));
     ui.add_space(2.0);
     response.clicked()
 }
@@ -547,6 +533,7 @@ fn accent_swatch(ui: &mut egui::Ui, color: Color32, selected: bool) -> bool {
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
+    response.widget_info(|| WidgetInfo::selected(WidgetType::Button, true, selected, "Accent colour"));
     response.clicked()
 }
 
@@ -567,6 +554,7 @@ fn grip_handle(pal: Palette, ui: &mut egui::Ui) -> egui::Response {
             painter.circle_filled(pos, 1.4, color);
         }
     }
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Other, true, "Drag to reorder hash"));
     response.on_hover_text("Drag to reorder")
 }
 
@@ -740,8 +728,31 @@ impl HasherApp {
         });
     }
 
+    /// Route chosen or dropped paths: a single file uses the rich single-file
+    /// view, several files are hashed as a batch.
+    fn dispatch_paths(&mut self, mut paths: Vec<PathBuf>, ctx: egui::Context) {
+        if paths.is_empty() {
+            return;
+        }
+        if paths.len() == 1 {
+            let path = paths.remove(0);
+            let mode = if is_ewf_path(&path) {
+                FileHashMode::EvidenceStream
+            } else {
+                FileHashMode::ContainerFile
+            };
+            self.begin_file_hash(path, mode, ctx);
+        } else {
+            self.begin_batch_hash(paths, ctx);
+        }
+    }
+
     fn begin_file_hash(&mut self, path: PathBuf, mode: FileHashMode, ctx: egui::Context) {
+        self.batch.clear();
+        self.batch_pending = 0;
+        self.batch_receiver = None;
         self.file_path = path.display().to_string();
+        self.file_is_ewf = is_ewf_path(&path);
         self.file_hash_mode = mode;
         self.results.clear();
         self.results_source = None;
@@ -757,7 +768,7 @@ impl HasherApp {
             FileHashMode::ContainerFile => format!("Hashing container file {}…", path.display()),
         };
         let (sender, receiver) = mpsc::channel();
-        self.receiver = Some(receiver);
+        self.file_receiver = Some(receiver);
         std::thread::spawn(move || {
             let result = match mode {
                 FileHashMode::EvidenceStream => {
@@ -771,13 +782,38 @@ impl HasherApp {
         });
     }
 
+    fn begin_batch_hash(&mut self, paths: Vec<PathBuf>, ctx: egui::Context) {
+        self.file_path.clear();
+        self.file_is_ewf = false;
+        self.results.clear();
+        self.results_source = None;
+        self.inspection = None;
+        self.batch.clear();
+        self.batch_pending = paths.len();
+        self.working = true;
+        self.status = format!("Hashing {} files…", paths.len());
+        let (sender, receiver) = mpsc::channel();
+        self.batch_receiver = Some(receiver);
+        std::thread::spawn(move || {
+            for path in paths {
+                let result = if is_ewf_path(&path) {
+                    hash_ewf_media(&path).map(|analysis| analysis.results)
+                } else {
+                    hash_file(&path)
+                };
+                let _ = sender.send((path, Box::new(result)));
+                ctx.request_repaint();
+            }
+        });
+    }
+
     fn begin_verify_file(&mut self, path: PathBuf, ctx: egui::Context) {
         self.verify_file = path.display().to_string();
         self.verifying = true;
         self.verify_report = None;
         self.status = format!("Hashing {} for verification…", path.display());
         let (sender, receiver) = mpsc::channel();
-        self.receiver = Some(receiver);
+        self.verify_receiver = Some(receiver);
         std::thread::spawn(move || {
             let result = if is_ewf_path(&path) {
                 hash_ewf_media(&path).map(|analysis| analysis.results)
@@ -797,53 +833,107 @@ impl HasherApp {
     }
 
     fn poll_work(&mut self) {
-        let message = self
-            .receiver
+        // Single-file hashing.
+        if let Some(WorkResult::Hashed(path, mode, result)) = self
+            .file_receiver
             .as_ref()
-            .and_then(|receiver| receiver.try_recv().ok());
-        let Some(message) = message else {
+            .and_then(|receiver| receiver.try_recv().ok())
+        {
+            self.file_receiver = None;
+            self.working = false;
+            match *result {
+                Ok((hashes, info)) => {
+                    self.results = hashes;
+                    self.results_source = Some(ResultSource::File);
+                    self.inspection = Some(info);
+                    self.status = match mode {
+                        FileHashMode::EvidenceStream => {
+                            format!("Hashed reconstructed evidence stream from {}", path.display())
+                        }
+                        FileHashMode::ContainerFile => {
+                            format!("Hashed container file {}", path.display())
+                        }
+                    };
+                }
+                Err(error) => {
+                    self.results.clear();
+                    self.results_source = None;
+                    self.inspection = None;
+                    self.status = format!("Error: {error:#}");
+                }
+            }
+        }
+
+        // Verification hashing.
+        if let Some(WorkResult::Verified(result)) = self
+            .verify_receiver
+            .as_ref()
+            .and_then(|receiver| receiver.try_recv().ok())
+        {
+            self.verify_receiver = None;
+            self.verifying = false;
+            match result {
+                Ok(hashes) => {
+                    let report = build_report(&self.verify_expected, &hashes);
+                    self.status = verify_status_line(&report);
+                    self.verify_report = Some(report);
+                }
+                Err(error) => self.status = format!("Verify failed: {error:#}"),
+            }
+        }
+
+        self.poll_batch();
+    }
+
+    fn poll_batch(&mut self) {
+        if self.batch_receiver.is_none() {
+            return;
+        }
+        while let Some((path, result)) = self
+            .batch_receiver
+            .as_ref()
+            .and_then(|receiver| receiver.try_recv().ok())
+        {
+            self.batch.push(BatchEntry {
+                path,
+                result: *result,
+            });
+            self.batch_pending = self.batch_pending.saturating_sub(1);
+        }
+        if self.batch_pending == 0 {
+            self.batch_receiver = None;
+            self.working = false;
+            let failed = self.batch.iter().filter(|e| e.result.is_err()).count();
+            self.status = if failed == 0 {
+                format!("Hashed {} files", self.batch.len())
+            } else {
+                format!("Hashed {} files · {failed} failed", self.batch.len())
+            };
+        }
+    }
+
+    fn export_batch(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name("hashes.txt")
+            .add_filter("Text or log", &["txt", "log"])
+            .save_file()
+        else {
             return;
         };
-        self.receiver = None;
-        match message {
-            WorkResult::Hashed(path, mode, result) => {
-                self.working = false;
-                match *result {
-                    Ok((hashes, info)) => {
-                        self.results = hashes;
-                        self.results_source = Some(ResultSource::File);
-                        self.inspection = Some(info);
-                        self.status = match mode {
-                            FileHashMode::EvidenceStream => {
-                                format!(
-                                    "Hashed reconstructed evidence stream from {}",
-                                    path.display()
-                                )
-                            }
-                            FileHashMode::ContainerFile => {
-                                format!("Hashed container file {}", path.display())
-                            }
-                        };
-                    }
-                    Err(error) => {
-                        self.results.clear();
-                        self.results_source = None;
-                        self.inspection = None;
-                        self.status = format!("Error: {error:#}");
-                    }
+        let mut out = String::new();
+        for entry in &self.batch {
+            match &entry.result {
+                Ok(hashes) => {
+                    out.push_str(&format!("# {}\n{}\n\n", entry.path.display(), format_results(hashes)));
+                }
+                Err(error) => {
+                    out.push_str(&format!("# {}\n(error: {error:#})\n\n", entry.path.display()));
                 }
             }
-            WorkResult::Verified(result) => {
-                self.verifying = false;
-                match result {
-                    Ok(hashes) => {
-                        let report = build_report(&self.verify_expected, &hashes);
-                        self.status = verify_status_line(&report);
-                        self.verify_report = Some(report);
-                    }
-                    Err(error) => self.status = format!("Verify failed: {error:#}"),
-                }
-            }
+        }
+        match fs::write(&path, out) {
+            Ok(()) => self.status = format!("Exported {}", path.display()),
+            Err(error) => self.status = format!("Export failed: {error}"),
         }
     }
 
@@ -1062,6 +1152,7 @@ impl HasherApp {
             color,
         );
 
+        response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, tooltip));
         response.on_hover_text(tooltip)
     }
 
@@ -1277,22 +1368,17 @@ impl eframe::App for HasherApp {
             window_resize_handles(&ctx);
         }
 
-        let dropped = ctx.input(|input| {
+        let dropped: Vec<PathBuf> = ctx.input(|input| {
             input
                 .raw
                 .dropped_files
                 .iter()
                 .filter_map(|f| f.path.clone())
-                .next()
+                .collect()
         });
-        if let Some(path) = dropped {
+        if !dropped.is_empty() {
             self.page = Page::File;
-            let mode = if is_ewf_path(&path) {
-                FileHashMode::EvidenceStream
-            } else {
-                FileHashMode::ContainerFile
-            };
-            self.begin_file_hash(path, mode, ctx.clone());
+            self.dispatch_paths(dropped, ctx.clone());
         }
 
         if self.custom_chrome {
@@ -1378,6 +1464,21 @@ impl eframe::App for HasherApp {
 
         self.supported_formats_window(&ctx);
     }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        let settings = PersistedSettings {
+            theme: self.theme,
+            accent: [
+                self.accent.r(),
+                self.accent.g(),
+                self.accent.b(),
+                self.accent.a(),
+            ],
+            order: self.order.clone(),
+            reorder_locked: self.reorder_locked,
+        };
+        eframe::set_value(storage, eframe::APP_KEY, &settings);
+    }
 }
 
 impl HasherApp {
@@ -1420,14 +1521,19 @@ impl HasherApp {
             pal,
             ui,
             "Hash a file or forensic container",
-            "Choose a file, or drag and drop one anywhere on the window.",
+            "Choose one or more files, or drag and drop them anywhere on the window.",
         );
 
         card(pal, ui, |ui| {
             ui.horizontal(|ui| {
+                let mut shown = if self.batch.is_empty() {
+                    self.file_path.clone()
+                } else {
+                    format!("{} files", self.batch_pending.max(self.batch.len()))
+                };
                 ui.add_enabled(
                     false,
-                    egui::TextEdit::singleline(&mut self.file_path)
+                    egui::TextEdit::singleline(&mut shown)
                         .hint_text("No file selected")
                         .desired_width(ui.available_width() - 110.0),
                 );
@@ -1435,20 +1541,15 @@ impl HasherApp {
                     if ui
                         .add_enabled(!self.working, egui::Button::new("Choose"))
                         .clicked()
-                        && let Some(path) = rfd::FileDialog::new().pick_file()
+                        && let Some(paths) = rfd::FileDialog::new().pick_files()
                     {
-                        let mode = if is_ewf_path(&path) {
-                            FileHashMode::EvidenceStream
-                        } else {
-                            FileHashMode::ContainerFile
-                        };
-                        self.begin_file_hash(path, mode, ctx.clone());
+                        self.dispatch_paths(paths, ctx.clone());
                     }
                 });
             });
         });
 
-        if is_ewf_path(PathBuf::from(&self.file_path)) {
+        if self.batch.is_empty() && self.file_is_ewf {
             ui.add_space(8.0);
             card(pal, ui, |ui| {
                 ui.label(RichText::new("Hash target").strong().color(pal.text));
@@ -1485,6 +1586,12 @@ impl HasherApp {
             });
         }
 
+        if !self.batch.is_empty() {
+            ui.add_space(10.0);
+            self.batch_table(ui);
+            return;
+        }
+
         if let Some(info) = self.inspection.clone() {
             ui.add_space(10.0);
             self.inspection_panel(ui, &info);
@@ -1496,6 +1603,78 @@ impl HasherApp {
         } else {
             ui.label(RichText::new("No results yet.").color(pal.text_muted));
         }
+    }
+
+    fn batch_table(&mut self, ui: &mut egui::Ui) {
+        let pal = self.pal;
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("{} files", self.batch.len()))
+                    .strong()
+                    .color(pal.text),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .add_enabled(!self.working, egui::Button::new("Export all"))
+                    .clicked()
+                {
+                    self.export_batch();
+                }
+            });
+        });
+        ui.add_space(6.0);
+
+        // Take the batch out so the per-row closures can still touch `self`.
+        let batch = std::mem::take(&mut self.batch);
+        for entry in &batch {
+            card(pal, ui, |ui| {
+                let name = entry
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| entry.path.display().to_string());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(name).strong().color(pal.text));
+                    if let Ok(hashes) = &entry.result {
+                        let hashes = hashes.clone();
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.small_button("Copy").clicked() {
+                                ui.ctx().copy_text(format_results(&hashes));
+                                self.status = "Copied hashes".into();
+                            }
+                        });
+                    }
+                });
+                ui.add_space(4.0);
+                match &entry.result {
+                    Ok(hashes) => {
+                        for hash in hashes {
+                            ui.horizontal(|ui| {
+                                chip(pal, ui, &hash.algorithm.to_string(), pal.accent);
+                                ui.add_space(4.0);
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&hash.value)
+                                            .monospace()
+                                            .size(12.0)
+                                            .color(pal.text),
+                                    )
+                                    .selectable(true)
+                                    .wrap(),
+                                );
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        ui.label(
+                            RichText::new(format!("Error: {error:#}")).color(pal.danger),
+                        );
+                    }
+                }
+            });
+            ui.add_space(6.0);
+        }
+        self.batch = batch;
     }
 
     fn page_verify(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -1562,6 +1741,15 @@ impl HasherApp {
                         ui.add_space(2.0);
                         chip(pal, ui, &algorithm.to_string(), pal.accent);
                     });
+                    if algorithm == Algorithm::Adler32 {
+                        ui.label(
+                            RichText::new(
+                                "8-hex values are ambiguous — confirm this is an ADLER32 checksum.",
+                            )
+                            .size(11.0)
+                            .color(pal.text_muted),
+                        );
+                    }
                 } else {
                     ui.label(
                         RichText::new(
@@ -1737,6 +1925,17 @@ impl HasherApp {
                     ui.add_space(4.0);
                 }
             });
+
+            if contrast_ratio(self.accent, pal.base) < 3.0 {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "⚠ This accent has low contrast with the background and may be hard to see.",
+                    )
+                    .size(11.0)
+                    .color(pal.warn),
+                );
+            }
         });
 
         ui.add_space(8.0);
@@ -1986,10 +2185,24 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Hasher",
         options,
-        Box::new(|creation| {
+        Box::new(move |creation| {
             HasherApp::install_font(&creation.egui_ctx);
             creation.egui_ctx.set_theme(Theme::Dark);
-            Ok(Box::new(HasherApp::with_custom_chrome(custom_chrome)))
+            let mut app = HasherApp::with_custom_chrome(custom_chrome);
+            if let Some(storage) = creation.storage
+                && let Some(saved) =
+                    eframe::get_value::<PersistedSettings>(storage, eframe::APP_KEY)
+            {
+                let [r, g, b, a] = saved.accent;
+                app.theme = saved.theme;
+                app.accent = Color32::from_rgba_premultiplied(r, g, b, a);
+                if !saved.order.is_empty() {
+                    app.order = saved.order;
+                }
+                app.reorder_locked = saved.reorder_locked;
+                app.style_key = None;
+            }
+            Ok(Box::new(app))
         }),
     )
 }

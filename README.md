@@ -12,7 +12,8 @@ connection after installation.
 
 - ADLER32, MD5, SHA-1, and SHA-256 in a single pass
 - Exact UTF-8 text and number-string hashing
-- Buffered, background file hashing with drag and drop
+- Buffered, background file hashing with single- or multi-file drag and drop
+- Theme, accent, and hash-row order remembered between runs
 - `.txt` and `.log` hash-value import and export
 - `.dd`, `.img`, `.raw`, numbered raw segments (`.001`, etc.), and EWF
   (`.E01`, `.Ex01`, `.L01`, `.Lx01`) identification
@@ -34,7 +35,13 @@ cargo run --bin hasher-cli -- file evidence.img --output evidence.log
 cargo run --bin hasher-cli -- ewf evidence.E01 --algorithm sha256
 cargo run --bin hasher-cli -- read acquisition.log
 cargo run --bin hasher-cli -- inspect evidence.E01
+cargo run --bin hasher-cli -- verify 900150983cd24fb0d6963f7d28e17f72 --text "abc"
+cargo run --bin hasher-cli -- verify <expected-hash> --file evidence.E01
 ```
+
+`verify` selects the algorithm from the length of the expected hash, compares it
+against the file or text, and exits `0` on a match, `1` on a mismatch, and `2`
+when the expected value or input cannot be used (handy in scripts and CI).
 
 For laggy virtual machines, the GUI now uses native OS window chrome by default
 because it is much cheaper to move and resize than the custom frameless window.

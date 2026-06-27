@@ -21,7 +21,7 @@ path = "src/bin/hasher-cli.rs"
 adler2 = "2.0"
 anyhow = "1.0"
 clap = { version = "4.6", features = ["derive"] }
-eframe = "0.35"
+eframe = { version = "0.35", features = ["persistence"] }
 ewf = "0.2.1"
 hex = "0.4"
 md-5 = "0.11"
