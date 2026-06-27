@@ -1,6 +1,6 @@
 [package]
 name = "hasher"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "A friendly desktop and command-line hashing calculator"
 license = "AGPL-3.0-only"
