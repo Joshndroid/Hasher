@@ -8,7 +8,7 @@ use eframe::egui::{
 use hasher::{
     Algorithm, FileInspection, HashResult, VerifyOutcome, VerifyReport, build_report,
     format_results, hash_bytes, hash_ewf_media, hash_file, inspect_file, is_ewf_path,
-    read_hash_list,
+    normalise_expected_hash, read_hash_list,
 };
 use std::{
     cmp::Ordering,
@@ -1720,11 +1720,7 @@ impl HasherApp {
             });
 
             ui.add_space(4.0);
-            let cleaned: String = self
-                .verify_expected
-                .chars()
-                .filter(|c| !c.is_whitespace() && *c != ':')
-                .collect();
+            let cleaned = normalise_expected_hash(&self.verify_expected);
             if !cleaned.is_empty() {
                 let detected = cleaned
                     .bytes()

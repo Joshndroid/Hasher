@@ -158,7 +158,7 @@ pub struct VerifyReport {
 
 /// Normalise an expected-hash string, pick the algorithm by length, and compare
 /// against the computed set.
-fn normalise_expected_hash(expected_raw: &str) -> String {
+pub fn normalise_expected_hash(expected_raw: &str) -> String {
     let expected_raw = strip_algorithm_label(expected_raw);
     let compact: String = expected_raw
         .chars()
@@ -599,6 +599,16 @@ mod tests {
 
         let mismatch = build_report(&"0".repeat(32), &computed);
         assert_eq!(mismatch.outcome, VerifyOutcome::Mismatch);
+    }
+
+    #[test]
+    fn normalises_labelled_expected_hashes() {
+        assert_eq!(
+            normalise_expected_hash(
+                "SHA-256 = BA7816BF 8F01CFEA 414140DE 5DAE2223 B00361A3 96177A9C B410FF61 F20015AD"
+            ),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     #[test]
