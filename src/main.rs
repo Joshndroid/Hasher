@@ -240,6 +240,8 @@ struct BatchEntry {
     result: anyhow::Result<Vec<HashResult>>,
 }
 
+type BatchMessage = (PathBuf, Box<anyhow::Result<Vec<HashResult>>>);
+
 struct HasherApp {
     custom_chrome: bool,
     page: Page,
@@ -268,7 +270,7 @@ struct HasherApp {
     working: bool,
     file_receiver: Option<Receiver<WorkResult>>,
     verify_receiver: Option<Receiver<WorkResult>>,
-    batch_receiver: Option<Receiver<(PathBuf, Box<anyhow::Result<Vec<HashResult>>>)>>,
+    batch_receiver: Option<Receiver<BatchMessage>>,
     update_state: UpdateState,
     update_receiver: Option<Receiver<anyhow::Result<UpdateInfo>>>,
     icon_texture: Option<egui::TextureHandle>,
