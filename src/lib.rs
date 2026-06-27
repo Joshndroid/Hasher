@@ -156,15 +156,56 @@ pub struct VerifyReport {
     pub note: String,
 }
 
-/// Normalise an expected-hash string (drop whitespace and `:` separators,
-/// lower-case it), pick the algorithm by length, and compare against the
-/// computed set.
-pub fn build_report(expected_raw: &str, computed_set: &[HashResult]) -> VerifyReport {
-    let expected: String = expected_raw
+/// Normalise an expected-hash string, pick the algorithm by length, and compare
+/// against the computed set.
+fn normalise_expected_hash(expected_raw: &str) -> String {
+    let expected_raw = strip_algorithm_label(expected_raw);
+    let compact: String = expected_raw
         .chars()
         .filter(|c| !c.is_whitespace() && *c != ':')
         .collect::<String>()
         .to_ascii_lowercase();
+
+    if compact.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return compact;
+    }
+
+    let extracted = extract_hashes(expected_raw);
+    if extracted.len() == 1 {
+        extracted[0].value.clone()
+    } else {
+        compact
+    }
+}
+
+fn strip_algorithm_label(value: &str) -> &str {
+    let trimmed = value.trim_start();
+    for label in [
+        "adler32", "adler-32", "md5", "sha1", "sha-1", "sha256", "sha-256",
+    ] {
+        let Some(prefix) = trimmed.get(..label.len()) else {
+            continue;
+        };
+        if !prefix.eq_ignore_ascii_case(label) {
+            continue;
+        }
+
+        let rest = &trimmed[label.len()..];
+        let has_boundary = rest
+            .chars()
+            .next()
+            .map(|c| !c.is_ascii_alphanumeric())
+            .unwrap_or(true);
+        if has_boundary {
+            return rest
+                .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, ':' | '=' | '-'));
+        }
+    }
+    trimmed
+}
+
+pub fn build_report(expected_raw: &str, computed_set: &[HashResult]) -> VerifyReport {
+    let expected = normalise_expected_hash(expected_raw);
 
     let mut report = VerifyReport {
         outcome: VerifyOutcome::Invalid,
@@ -552,9 +593,9 @@ mod tests {
         assert_eq!(good.outcome, VerifyOutcome::Match);
         assert_eq!(good.algorithm, Some(Algorithm::Md5));
 
-        // Whitespace and `:` separators are tolerated, case-insensitively.
+        // Labels, whitespace and `:` separators are tolerated, case-insensitively.
         let spaced = build_report("MD5: 90015098 3CD24FB0 D6963F7D 28E17F72", &computed);
-        assert_eq!(spaced.outcome, VerifyOutcome::Mismatch);
+        assert_eq!(spaced.outcome, VerifyOutcome::Match);
 
         let mismatch = build_report(&"0".repeat(32), &computed);
         assert_eq!(mismatch.outcome, VerifyOutcome::Mismatch);
