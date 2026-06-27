@@ -7,8 +7,8 @@ use eframe::egui::{
 };
 use hasher::{
     Algorithm, FileInspection, HashResult, VerifyOutcome, VerifyReport, build_report,
-    detect_expected_algorithm, format_results, hash_bytes, hash_ewf_media, hash_file,
-    inspect_file, is_ewf_path, normalise_expected_hash, read_hash_list,
+    detect_expected_algorithm, format_results, hash_bytes, hash_ewf_media, hash_file, inspect_file,
+    is_ewf_path, normalise_expected_hash, read_hash_list,
 };
 use std::{
     cmp::Ordering,
@@ -395,7 +395,8 @@ fn nav_button(pal: Palette, ui: &mut egui::Ui, selected: bool, label: &str) -> b
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    response.widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, true, selected, label));
+    response
+        .widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, true, selected, label));
     ui.add_space(2.0);
     response.clicked()
 }
@@ -535,7 +536,8 @@ fn accent_swatch(ui: &mut egui::Ui, color: Color32, selected: bool) -> bool {
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    response.widget_info(|| WidgetInfo::selected(WidgetType::Button, true, selected, "Accent colour"));
+    response
+        .widget_info(|| WidgetInfo::selected(WidgetType::Button, true, selected, "Accent colour"));
     response.clicked()
 }
 
@@ -850,7 +852,10 @@ impl HasherApp {
                     self.inspection = Some(info);
                     self.status = match mode {
                         FileHashMode::EvidenceStream => {
-                            format!("Hashed reconstructed evidence stream from {}", path.display())
+                            format!(
+                                "Hashed reconstructed evidence stream from {}",
+                                path.display()
+                            )
                         }
                         FileHashMode::ContainerFile => {
                             format!("Hashed container file {}", path.display())
@@ -926,10 +931,17 @@ impl HasherApp {
         for entry in &self.batch {
             match &entry.result {
                 Ok(hashes) => {
-                    out.push_str(&format!("# {}\n{}\n\n", entry.path.display(), format_results(hashes)));
+                    out.push_str(&format!(
+                        "# {}\n{}\n\n",
+                        entry.path.display(),
+                        format_results(hashes)
+                    ));
                 }
                 Err(error) => {
-                    out.push_str(&format!("# {}\n(error: {error:#})\n\n", entry.path.display()));
+                    out.push_str(&format!(
+                        "# {}\n(error: {error:#})\n\n",
+                        entry.path.display()
+                    ));
                 }
             }
         }
@@ -1668,9 +1680,7 @@ impl HasherApp {
                         }
                     }
                     Err(error) => {
-                        ui.label(
-                            RichText::new(format!("Error: {error:#}")).color(pal.danger),
-                        );
+                        ui.label(RichText::new(format!("Error: {error:#}")).color(pal.danger));
                     }
                 }
             });

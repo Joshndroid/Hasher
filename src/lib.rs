@@ -507,9 +507,7 @@ fn count_segments(path: &Path, kind: EvidenceKind) -> usize {
                     && ext.chars().all(|c| c.is_ascii_alphanumeric())
             } else {
                 let entry_prefix = stem.trim_end_matches(|c: char| c.is_ascii_digit());
-                entry_prefix == prefix
-                    && ext.len() == 3
-                    && ext.chars().all(|c| c.is_ascii_digit())
+                entry_prefix == prefix && ext.len() == 3 && ext.chars().all(|c| c.is_ascii_digit())
             }
         })
         .count()
@@ -634,10 +632,7 @@ mod tests {
     fn build_report_accepts_common_expected_hash_formats() {
         let computed = hash_bytes(b"abc");
         let cases = [
-            (
-                "MD5: 900150983cd24fb0d6963f7d28e17f72",
-                Algorithm::Md5,
-            ),
+            ("MD5: 900150983cd24fb0d6963f7d28e17f72", Algorithm::Md5),
             (
                 "sha1 = A9993E364706816ABA3E25717850C26C9CD0D89D",
                 Algorithm::Sha1,

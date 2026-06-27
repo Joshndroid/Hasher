@@ -97,10 +97,7 @@ fn run_verify(expected: &str, file: Option<PathBuf>, text: Option<String>) -> Re
         (None, None) => bail!("provide --file <PATH> or --text <STRING> to hash"),
     };
     let report = build_report(expected, &computed);
-    let algorithm = report
-        .algorithm
-        .map(|a| a.to_string())
-        .unwrap_or_default();
+    let algorithm = report.algorithm.map(|a| a.to_string()).unwrap_or_default();
     match report.outcome {
         VerifyOutcome::Match => {
             println!("MATCH {algorithm} {}", report.expected);
