@@ -612,6 +612,35 @@ mod tests {
     }
 
     #[test]
+    fn build_report_accepts_common_expected_hash_formats() {
+        let computed = hash_bytes(b"abc");
+        let cases = [
+            (
+                "MD5: 900150983cd24fb0d6963f7d28e17f72",
+                Algorithm::Md5,
+            ),
+            (
+                "sha1 = A9993E364706816ABA3E25717850C26C9CD0D89D",
+                Algorithm::Sha1,
+            ),
+            (
+                "SHA-256 (ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad)",
+                Algorithm::Sha256,
+            ),
+            (
+                "90:01:50:98:3c:d2:4f:b0:d6:96:3f:7d:28:e1:7f:72",
+                Algorithm::Md5,
+            ),
+        ];
+
+        for (expected, algorithm) in cases {
+            let report = build_report(expected, &computed);
+            assert_eq!(report.outcome, VerifyOutcome::Match, "{expected}");
+            assert_eq!(report.algorithm, Some(algorithm), "{expected}");
+        }
+    }
+
+    #[test]
     fn build_report_rejects_bad_input() {
         let computed = hash_bytes(b"abc");
         assert_eq!(build_report("", &computed).outcome, VerifyOutcome::Invalid);
