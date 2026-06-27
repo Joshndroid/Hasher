@@ -40,6 +40,12 @@ enum FileHashMode {
     ContainerFile,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum ResultSource {
+    Text,
+    File,
+}
+
 enum WorkResult {
     Hashed(
         PathBuf,
@@ -271,6 +277,7 @@ struct HasherApp {
     text: String,
     file_path: String,
     results: Vec<HashResult>,
+    results_source: Option<ResultSource>,
     inspection: Option<FileInspection>,
     file_hash_mode: FileHashMode,
     verify_expected: String,
@@ -305,7 +312,8 @@ impl Default for HasherApp {
             pal: palette(true, accent),
             text: String::new(),
             file_path: String::new(),
-            results: hash_bytes(b""),
+            results: Vec::new(),
+            results_source: None,
             inspection: None,
             file_hash_mode: FileHashMode::ContainerFile,
             verify_expected: String::new(),
@@ -733,6 +741,9 @@ impl HasherApp {
     fn begin_file_hash(&mut self, path: PathBuf, mode: FileHashMode, ctx: egui::Context) {
         self.file_path = path.display().to_string();
         self.file_hash_mode = mode;
+        self.results.clear();
+        self.results_source = None;
+        self.inspection = None;
         self.working = true;
         self.status = match mode {
             FileHashMode::EvidenceStream => {
@@ -798,6 +809,7 @@ impl HasherApp {
                 match *result {
                     Ok((hashes, info)) => {
                         self.results = hashes;
+                        self.results_source = Some(ResultSource::File);
                         self.inspection = Some(info);
                         self.status = match mode {
                             FileHashMode::EvidenceStream => {
@@ -811,7 +823,12 @@ impl HasherApp {
                             }
                         };
                     }
-                    Err(error) => self.status = format!("Error: {error:#}"),
+                    Err(error) => {
+                        self.results.clear();
+                        self.results_source = None;
+                        self.inspection = None;
+                        self.status = format!("Error: {error:#}");
+                    }
                 }
             }
             WorkResult::Verified(result) => {
@@ -887,6 +904,9 @@ impl HasherApp {
     /// drop any that vanished, append any new ones at the end.
     fn reconcile_order(&mut self) {
         let present: Vec<Algorithm> = self.results.iter().map(|r| r.algorithm).collect();
+        if present.is_empty() {
+            return;
+        }
         self.order.retain(|a| present.contains(a));
         for algorithm in present {
             if !self.order.contains(&algorithm) {
@@ -1372,11 +1392,22 @@ impl HasherApp {
                 .font(egui::TextStyle::Monospace),
         );
         if response.changed() {
-            self.results = hash_bytes(self.text.as_bytes());
-            self.status = format!("{} bytes", self.text.len());
+            if self.text.is_empty() {
+                self.results.clear();
+                self.results_source = None;
+                self.status = "Ready".into();
+            } else {
+                self.results = hash_bytes(self.text.as_bytes());
+                self.results_source = Some(ResultSource::Text);
+                self.status = format!("{} bytes", self.text.len());
+            }
         }
         ui.add_space(10.0);
-        self.result_table(ui);
+        if self.results_source == Some(ResultSource::Text) {
+            self.result_table(ui);
+        } else {
+            ui.label(RichText::new("No results yet.").color(pal.text_muted));
+        }
     }
 
     fn page_file(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -1456,7 +1487,11 @@ impl HasherApp {
         }
 
         ui.add_space(10.0);
-        self.result_table(ui);
+        if self.results_source == Some(ResultSource::File) {
+            self.result_table(ui);
+        } else {
+            ui.label(RichText::new("No results yet.").color(pal.text_muted));
+        }
     }
 
     fn page_verify(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
