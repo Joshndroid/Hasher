@@ -292,6 +292,7 @@ struct HasherApp {
     update_state: UpdateState,
     update_receiver: Option<Receiver<anyhow::Result<UpdateInfo>>>,
     icon_texture: Option<egui::TextureHandle>,
+    supported_formats_open: bool,
     /// User-chosen display order for the hash rows, keyed by algorithm so it
     /// survives re-hashing when the text or file changes.
     order: Vec<Algorithm>,
@@ -328,6 +329,7 @@ impl Default for HasherApp {
             update_state: UpdateState::Idle,
             update_receiver: None,
             icon_texture: None,
+            supported_formats_open: false,
             order: Algorithm::ALL.to_vec(),
             reorder_locked: false,
             style_key: None,
@@ -1373,6 +1375,8 @@ impl eframe::App for HasherApp {
                         });
                 });
         });
+
+        self.supported_formats_window(&ctx);
     }
 }
 
@@ -1836,8 +1840,105 @@ impl HasherApp {
                     .size(12.0)
                     .color(pal.text_muted),
             );
+            ui.add_space(8.0);
+            if ui.button("Supported hashes & containers").clicked() {
+                self.supported_formats_open = true;
+            }
         });
     }
+
+    fn supported_formats_window(&mut self, ctx: &egui::Context) {
+        if !self.supported_formats_open {
+            return;
+        }
+
+        let pal = self.pal;
+        egui::Window::new("Supported hashes & containers")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .open(&mut self.supported_formats_open)
+            .show(ctx, |ui| {
+                ui.set_min_width(420.0);
+                ui.label(
+                    RichText::new("Hash algorithms")
+                        .size(15.0)
+                        .strong()
+                        .color(pal.text),
+                );
+                ui.add_space(6.0);
+                for (name, detail) in [
+                    ("ADLER32", "8 hex characters"),
+                    ("MD5", "32 hex characters"),
+                    ("SHA-1", "40 hex characters"),
+                    ("SHA-256", "64 hex characters"),
+                ] {
+                    ui.horizontal(|ui| {
+                        chip(pal, ui, name, pal.accent);
+                        ui.label(RichText::new(detail).color(pal.text_muted));
+                    });
+                    ui.add_space(3.0);
+                }
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(10.0);
+
+                ui.label(
+                    RichText::new("Forensic containers and images")
+                        .size(15.0)
+                        .strong()
+                        .color(pal.text),
+                );
+                ui.add_space(6.0);
+                supported_format_row(
+                    pal,
+                    ui,
+                    "EWF / Expert Witness",
+                    ".E01, .Ex01, .L01, .Lx01 segment families",
+                    "Detects EVF, EVF2 and LEF2 signatures, decodes metadata, stored MD5/SHA-1 values and acquisition errors, and can hash the reconstructed evidence stream.",
+                );
+                supported_format_row(
+                    pal,
+                    ui,
+                    "Raw images",
+                    ".dd, .img, .raw",
+                    "Hashes the selected image byte-for-byte.",
+                );
+                supported_format_row(
+                    pal,
+                    ui,
+                    "Segmented raw images",
+                    ".001, .002, .003 and matching numbered segments",
+                    "Detects sibling segments and warns that hashing one path covers only the selected segment.",
+                );
+                supported_format_row(
+                    pal,
+                    ui,
+                    "Sidecar hash lists",
+                    ".txt, .log",
+                    "Extracts supported hash values from sidecar files next to the selected image.",
+                );
+            });
+    }
+}
+
+fn supported_format_row(
+    pal: Palette,
+    ui: &mut egui::Ui,
+    title: &str,
+    extensions: &str,
+    detail: &str,
+) {
+    ui.label(RichText::new(title).strong().color(pal.text));
+    ui.label(
+        RichText::new(extensions)
+            .monospace()
+            .size(12.0)
+            .color(pal.accent),
+    );
+    ui.add(egui::Label::new(RichText::new(detail).color(pal.text_muted)).wrap());
+    ui.add_space(8.0);
 }
 
 fn env_flag(name: &str) -> bool {
