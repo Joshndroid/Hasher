@@ -178,6 +178,19 @@ pub fn normalise_expected_hash(expected_raw: &str) -> String {
     }
 }
 
+pub fn detect_expected_algorithm(expected_raw: &str) -> Option<Algorithm> {
+    let expected = normalise_expected_hash(expected_raw);
+    expected
+        .bytes()
+        .all(|b| b.is_ascii_hexdigit())
+        .then(|| {
+            Algorithm::ALL
+                .into_iter()
+                .find(|a| a.hex_len() == expected.len())
+        })
+        .flatten()
+}
+
 fn strip_algorithm_label(value: &str) -> &str {
     let trimmed = value.trim_start();
     for label in [
@@ -224,10 +237,7 @@ pub fn build_report(expected_raw: &str, computed_set: &[HashResult]) -> VerifyRe
         return report;
     }
 
-    let Some(algorithm) = Algorithm::ALL
-        .into_iter()
-        .find(|a| a.hex_len() == expected.len())
-    else {
+    let Some(algorithm) = detect_expected_algorithm(&expected) else {
         report.note = format!(
             "{} hex characters doesn't match ADLER32 (8), MD5 (32), SHA-1 (40) or SHA-256 (64).",
             expected.len()
@@ -609,6 +619,15 @@ mod tests {
             ),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn detects_expected_hash_algorithm_after_normalising() {
+        assert_eq!(
+            detect_expected_algorithm("MD5: 900150983cd24fb0d6963f7d28e17f72"),
+            Some(Algorithm::Md5)
+        );
+        assert_eq!(detect_expected_algorithm("not a hash"), None);
     }
 
     #[test]

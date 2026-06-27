@@ -7,8 +7,8 @@ use eframe::egui::{
 };
 use hasher::{
     Algorithm, FileInspection, HashResult, VerifyOutcome, VerifyReport, build_report,
-    format_results, hash_bytes, hash_ewf_media, hash_file, inspect_file, is_ewf_path,
-    normalise_expected_hash, read_hash_list,
+    detect_expected_algorithm, format_results, hash_bytes, hash_ewf_media, hash_file,
+    inspect_file, is_ewf_path, normalise_expected_hash, read_hash_list,
 };
 use std::{
     cmp::Ordering,
@@ -1724,15 +1724,7 @@ impl HasherApp {
             ui.add_space(4.0);
             let cleaned = normalise_expected_hash(&self.verify_expected);
             if !cleaned.is_empty() {
-                let detected = cleaned
-                    .bytes()
-                    .all(|b| b.is_ascii_hexdigit())
-                    .then(|| {
-                        Algorithm::ALL
-                            .into_iter()
-                            .find(|a| a.hex_len() == cleaned.len())
-                    })
-                    .flatten();
+                let detected = detect_expected_algorithm(&self.verify_expected);
                 if let Some(algorithm) = detected {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("Detected").size(11.0).color(pal.text_muted));
