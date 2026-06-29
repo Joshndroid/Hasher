@@ -22,7 +22,7 @@ adler2 = "2.0"
 anyhow = "1.0"
 clap = { version = "4.6", features = ["derive"] }
 eframe = { version = "0.35", features = ["persistence"] }
-ewf = "0.2.1"
+ewf = "0.3.0"
 hex = "0.4"
 md-5 = "0.11"
 rfd = "0.17"
