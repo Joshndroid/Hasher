@@ -28,4 +28,5 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked --version 0.22.2
       - name: Audit Cargo.lock
-        run: cargo audit
+        # quick-xml is reachable only through disabled Linux window-system backends.
+        run: cargo audit --target-os macos --target-os windows --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195

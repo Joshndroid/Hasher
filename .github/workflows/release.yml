@@ -24,7 +24,7 @@ env:
 jobs:
   verify:
     name: Verify release source
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     timeout-minutes: 45
     steps:
       - name: Validate release tag
@@ -55,7 +55,8 @@ jobs:
       - name: Audit locked dependencies
         run: |
           cargo install cargo-audit --locked --version 0.22.2
-          cargo audit
+          # quick-xml is reachable only through disabled Linux window-system backends.
+          cargo audit --target-os macos --target-os windows --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Run tests

@@ -1,5 +1,8 @@
 //! Shared hashing and forensic-file inspection used by both front ends.
 
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+compile_error!("Hasher supports only macOS and Windows.");
+
 use adler2::Adler32;
 use anyhow::{Context, Result, bail};
 use md5::Md5;
