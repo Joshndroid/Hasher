@@ -9,7 +9,8 @@ use hasher::{
     Algorithm, FileInspection, HashResult, ManifestEntry, ManifestFormat, VerifyOutcome,
     VerifyReport, build_report, collect_files_recursively, detect_expected_algorithm,
     format_manifest, format_results, hash_bytes, hash_ewf_media_with_progress,
-    hash_file_with_progress, inspect_file, is_ewf_path, normalise_expected_hash, read_hash_list,
+    hash_file_with_progress, hash_raw_media_with_progress, inspect_file, is_ewf_path,
+    is_raw_segment_path, normalise_expected_hash, raw_segment_paths, read_hash_list,
 };
 use std::{
     cmp::Ordering,
@@ -284,9 +285,8 @@ struct HasherApp {
     pal: Palette,
     text: String,
     file_path: String,
-    /// Cached EWF detection for the current `file_path`, so the File page does
-    /// not re-open the file from disk on every frame.
-    file_is_ewf: bool,
+    /// Whether the current path belongs to a reconstructable segmented image.
+    file_is_logical_set: bool,
     results: Vec<HashResult>,
     results_source: Option<ResultSource>,
     inspection: Option<FileInspection>,
@@ -334,7 +334,7 @@ impl Default for HasherApp {
             pal: palette(true, accent),
             text: String::new(),
             file_path: String::new(),
-            file_is_ewf: false,
+            file_is_logical_set: false,
             results: Vec::new(),
             results_source: None,
             inspection: None,
@@ -841,7 +841,7 @@ impl HasherApp {
         }
         if paths.len() == 1 {
             let path = paths.remove(0);
-            let mode = if is_ewf_path(&path) {
+            let mode = if is_ewf_path(&path) || is_raw_segment_path(&path) {
                 FileHashMode::EvidenceStream
             } else {
                 FileHashMode::ContainerFile
@@ -872,7 +872,7 @@ impl HasherApp {
         self.batch_receiver = None;
         self.batch_root = None;
         self.file_path = path.display().to_string();
-        self.file_is_ewf = is_ewf_path(&path);
+        self.file_is_logical_set = is_ewf_path(&path) || is_raw_segment_path(&path);
         self.file_hash_mode = mode;
         self.results.clear();
         self.results_source = None;
@@ -884,7 +884,7 @@ impl HasherApp {
         self.status = match mode {
             FileHashMode::EvidenceStream => {
                 format!(
-                    "Reconstructing and hashing EWF evidence stream {}…",
+                    "Reconstructing and hashing evidence stream {}…",
                     path.display()
                 )
             }
@@ -894,10 +894,17 @@ impl HasherApp {
         self.file_receiver = Some(receiver);
         std::thread::spawn(move || {
             let total = match mode {
-                FileHashMode::EvidenceStream => inspect_file(&path)
+                FileHashMode::EvidenceStream if is_ewf_path(&path) => inspect_file(&path)
                     .ok()
                     .and_then(|info| info.ewf.map(|ewf| ewf.media_size))
                     .unwrap_or(0),
+                FileHashMode::EvidenceStream => raw_segment_paths(&path)
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|segment| fs::metadata(segment).ok())
+                    .map(|metadata| metadata.len())
+                    .sum(),
                 FileHashMode::ContainerFile => fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
             };
             let progress_sender = sender.clone();
@@ -909,8 +916,12 @@ impl HasherApp {
                 keep_going
             };
             let result = match mode {
-                FileHashMode::EvidenceStream => {
+                FileHashMode::EvidenceStream if is_ewf_path(&path) => {
                     hash_ewf_media_with_progress(&path, &mut report_progress)
+                        .map(|analysis| (analysis.results, analysis.inspection))
+                }
+                FileHashMode::EvidenceStream => {
+                    hash_raw_media_with_progress(&path, &mut report_progress)
                         .map(|analysis| (analysis.results, analysis.inspection))
                 }
                 FileHashMode::ContainerFile => hash_file_with_progress(&path, &mut report_progress)
@@ -927,7 +938,7 @@ impl HasherApp {
 
     fn begin_batch_hash(&mut self, paths: Vec<PathBuf>, ctx: egui::Context) {
         self.file_path.clear();
-        self.file_is_ewf = false;
+        self.file_is_logical_set = false;
         self.results.clear();
         self.results_source = None;
         self.inspection = None;
@@ -994,11 +1005,20 @@ impl HasherApp {
         self.verify_receiver = Some(receiver);
         std::thread::spawn(move || {
             let ewf = is_ewf_path(&path);
+            let raw_set = is_raw_segment_path(&path);
             let total = if ewf {
                 inspect_file(&path)
                     .ok()
                     .and_then(|info| info.ewf.map(|details| details.media_size))
                     .unwrap_or(0)
+            } else if raw_set {
+                raw_segment_paths(&path)
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|segment| fs::metadata(segment).ok())
+                    .map(|metadata| metadata.len())
+                    .sum()
             } else {
                 fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
             };
@@ -1012,6 +1032,9 @@ impl HasherApp {
             };
             let result = if ewf {
                 hash_ewf_media_with_progress(&path, &mut report_progress)
+                    .map(|analysis| analysis.results)
+            } else if raw_set {
+                hash_raw_media_with_progress(&path, &mut report_progress)
                     .map(|analysis| analysis.results)
             } else {
                 hash_file_with_progress(&path, &mut report_progress)
@@ -1850,7 +1873,7 @@ impl HasherApp {
             });
         });
 
-        if self.batch.is_empty() && self.file_is_ewf {
+        if self.batch.is_empty() && self.file_is_logical_set {
             ui.add_space(8.0);
             card(pal, ui, |ui| {
                 ui.label(RichText::new("Hash target").strong().color(pal.text));
@@ -1863,7 +1886,7 @@ impl HasherApp {
                 ui.radio_value(
                     &mut self.file_hash_mode,
                     FileHashMode::ContainerFile,
-                    "Selected container segment",
+                    "Selected segment file",
                 );
                 ui.add_space(6.0);
                 if ui
@@ -2438,7 +2461,7 @@ impl HasherApp {
                     ui,
                     "Segmented raw images",
                     ".001, .002, .003 and matching numbered segments",
-                    "Detects sibling segments and warns that hashing one path covers only the selected segment.",
+                    "Reconstructs complete contiguous sets in numeric order for logical-stream hashing; selected-file mode remains available.",
                 );
                 supported_format_row(
                     pal,

@@ -209,6 +209,18 @@ pub fn hash_file_with_progress(
         .with_context(|| format!("could not read {}", path.display()))
 }
 
+/// Returns `true` for conventional numbered raw segment suffixes (`.001`-`.999`).
+pub fn is_raw_segment_path(path: impl AsRef<Path>) -> bool {
+    path.as_ref()
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.len() == 3
+                && extension.chars().all(|c| c.is_ascii_digit())
+                && extension != "000"
+        })
+}
+
 pub fn format_results(results: &[HashResult]) -> String {
     results
         .iter()
@@ -635,6 +647,13 @@ pub struct EwfAnalysis {
     pub inspection: FileInspection,
 }
 
+#[derive(Clone, Debug)]
+pub struct RawAnalysis {
+    pub results: Vec<HashResult>,
+    pub inspection: FileInspection,
+    pub media_size: u64,
+}
+
 pub fn is_ewf_path(path: impl AsRef<Path>) -> bool {
     let path = path.as_ref();
     let ext = path
@@ -741,6 +760,139 @@ pub fn hash_ewf_media_with_progress(
     })
 }
 
+/// Discovers the complete contiguous numbered raw set containing `path`.
+pub fn raw_segment_paths(path: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
+    let path = path.as_ref();
+    if !is_raw_segment_path(path) {
+        bail!("{} is not a numbered raw segment", path.display());
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let wanted_stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("");
+    let mut numbered = Vec::new();
+    for entry in fs::read_dir(parent)
+        .with_context(|| format!("could not inspect raw segment set at {}", parent.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let candidate = entry.path();
+        let stem = candidate
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("");
+        let extension = candidate
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("");
+        if stem.eq_ignore_ascii_case(wanted_stem)
+            && extension.len() == 3
+            && extension.chars().all(|c| c.is_ascii_digit())
+        {
+            let number: u16 = extension.parse().expect("three ASCII digits");
+            if number > 0 {
+                numbered.push((number, candidate));
+            }
+        }
+    }
+    numbered.sort_by_key(|(number, _)| *number);
+    if numbered.first().map(|(number, _)| *number) != Some(1) {
+        bail!(
+            "raw segment set for {} is incomplete: .001 is missing",
+            path.display()
+        );
+    }
+    for pair in numbered.windows(2) {
+        let expected = pair[0].0 + 1;
+        if pair[1].0 == pair[0].0 {
+            bail!(
+                "raw segment set for {} contains duplicate .{:03} segments",
+                path.display(),
+                pair[0].0
+            );
+        }
+        if pair[1].0 != expected {
+            bail!(
+                "raw segment set for {} is incomplete: .{:03} is missing",
+                path.display(),
+                expected
+            );
+        }
+    }
+    Ok(numbered.into_iter().map(|(_, path)| path).collect())
+}
+
+struct RawSegmentReader {
+    paths: std::vec::IntoIter<PathBuf>,
+    current: Option<BufReader<File>>,
+}
+
+impl RawSegmentReader {
+    fn open(paths: Vec<PathBuf>) -> io::Result<Self> {
+        let mut paths = paths.into_iter();
+        let current = paths
+            .next()
+            .map(File::open)
+            .transpose()?
+            .map(BufReader::new);
+        Ok(Self { paths, current })
+    }
+}
+
+impl Read for RawSegmentReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let Some(current) = &mut self.current else {
+                return Ok(0);
+            };
+            let read = current.read(buffer)?;
+            if read != 0 {
+                return Ok(read);
+            }
+            self.current = self
+                .paths
+                .next()
+                .map(File::open)
+                .transpose()?
+                .map(BufReader::new);
+        }
+    }
+}
+
+/// Hashes all numbered raw segments in numeric order as one logical stream.
+pub fn hash_raw_media(path: impl AsRef<Path>) -> Result<RawAnalysis> {
+    hash_raw_media_with_progress(path, |_| true)
+}
+
+pub fn hash_raw_media_with_progress(
+    path: impl AsRef<Path>,
+    progress: impl FnMut(u64) -> bool,
+) -> Result<RawAnalysis> {
+    let path = path.as_ref();
+    let paths = raw_segment_paths(path)?;
+    let media_size = paths.iter().try_fold(0_u64, |total, segment| {
+        segment
+            .metadata()
+            .map(|metadata| total.saturating_add(metadata.len()))
+    })?;
+    let reader = RawSegmentReader::open(paths)
+        .with_context(|| format!("could not open raw segment set at {}", path.display()))?;
+    let results = hash_reader_with_progress(reader, progress)
+        .context("could not read the reconstructed raw evidence stream")?;
+    let inspection = inspect_file(path)?;
+    Ok(RawAnalysis {
+        results,
+        inspection,
+        media_size,
+    })
+}
+
 fn ewf_inspection(
     path: &Path,
     details: EwfDetails,
@@ -780,7 +932,7 @@ pub fn inspect_file(path: impl AsRef<Path>) -> Result<FileInspection> {
         .to_ascii_lowercase();
     let kind = if is_ewf_path(path) {
         EvidenceKind::ExpertWitness
-    } else if ext.len() == 3 && ext.chars().all(|c| c.is_ascii_digit()) {
+    } else if is_raw_segment_path(path) {
         EvidenceKind::RawSegment
     } else if matches!(ext.as_str(), "dd" | "img" | "raw") {
         EvidenceKind::RawImage
@@ -799,7 +951,10 @@ pub fn inspect_file(path: impl AsRef<Path>) -> Result<FileInspection> {
     let sidecar = read_sidecar_hashes(path)?;
     let note = match kind {
         EvidenceKind::ExpertWitness => unreachable!(),
-        EvidenceKind::RawSegment => "A segmented raw image was detected. Hashing only this path covers this segment, not the complete image set.".into(),
+        EvidenceKind::RawSegment => match raw_segment_paths(path) {
+            Ok(_) => "A complete segmented raw image was detected. Evidence-stream hashing reconstructs the logical media in numeric order; selected-file hashing covers only this segment.".into(),
+            Err(error) => format!("A numbered raw image segment was detected, but its set cannot be reconstructed: {error:#}. Selected-file hashing still covers only this segment."),
+        },
         EvidenceKind::RawImage => "Raw images have no standard embedded digest field; any discovered values came from a sidecar TXT/LOG file.".into(),
         EvidenceKind::OrdinaryFile => "The complete file can be hashed byte-for-byte.".into(),
     };
@@ -815,16 +970,32 @@ pub fn inspect_file(path: impl AsRef<Path>) -> Result<FileInspection> {
 }
 
 fn count_segments(path: &Path, kind: EvidenceKind) -> usize {
+    if kind == EvidenceKind::RawSegment {
+        return raw_segment_paths(path)
+            .map(|segments| segments.len())
+            .unwrap_or_else(|_| {
+                let Some(parent) = path.parent() else {
+                    return 1;
+                };
+                let wanted_stem = path.file_stem();
+                fs::read_dir(parent)
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .filter(|entry| {
+                        let candidate = entry.path();
+                        candidate.file_stem() == wanted_stem && is_raw_segment_path(&candidate)
+                    })
+                    .count()
+                    .max(1)
+            });
+    }
     let Some(parent) = path.parent() else {
         return 1;
     };
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-    let prefix = if kind == EvidenceKind::ExpertWitness {
-        stem.to_ascii_lowercase()
-    } else {
-        stem.trim_end_matches(|c: char| c.is_ascii_digit())
-            .to_ascii_lowercase()
-    };
+    let prefix = stem.to_ascii_lowercase();
     std::fs::read_dir(parent)
         .ok()
         .into_iter()
@@ -843,8 +1014,7 @@ fn count_segments(path: &Path, kind: EvidenceKind) -> usize {
                     && ext.len() >= 3
                     && ext.chars().all(|c| c.is_ascii_alphanumeric())
             } else {
-                let entry_prefix = stem.trim_end_matches(|c: char| c.is_ascii_digit());
-                entry_prefix == prefix && ext.len() == 3 && ext.chars().all(|c| c.is_ascii_digit())
+                unreachable!()
             }
         })
         .count()
@@ -899,6 +1069,15 @@ fn read_sidecar_hashes(path: &Path) -> Result<Vec<HashResult>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn raw_test_dir(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("hasher-{name}-{}-{nonce}", std::process::id()))
+    }
 
     #[test]
     fn known_abc_vectors() {
@@ -925,6 +1104,36 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         assert_eq!(reports, vec![0, 1024 * 1024]);
+    }
+
+    #[test]
+    fn hashes_numbered_raw_segments_as_one_stream() {
+        let directory = raw_test_dir("raw-stream");
+        fs::create_dir(&directory).unwrap();
+        let first = directory.join("evidence.001");
+        fs::write(&first, b"ab").unwrap();
+        fs::write(directory.join("evidence.002"), b"c").unwrap();
+
+        let analysis = hash_raw_media(&first).unwrap();
+        assert_eq!(analysis.results, hash_bytes(b"abc"));
+        assert_eq!(analysis.media_size, 3);
+        assert_eq!(analysis.inspection.segment_count, 2);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rejects_incomplete_numbered_raw_sets() {
+        let directory = raw_test_dir("raw-gap");
+        fs::create_dir(&directory).unwrap();
+        let first = directory.join("evidence.001");
+        fs::write(&first, b"a").unwrap();
+        fs::write(directory.join("evidence.003"), b"c").unwrap();
+
+        let error = hash_raw_media(&first).unwrap_err();
+        assert!(error.to_string().contains(".002 is missing"));
+
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

@@ -96,7 +96,9 @@ settings and signing secrets.
 
 ## Forensic-image semantics
 
-A raw `.dd`, `.img`, or `.001` file contains evidence bytes directly. An EWF image
+A raw `.dd`, `.img`, or `.001` file contains evidence bytes directly. Numbered
+raw sets (`.001`, `.002`, ...) can also be reconstructed by concatenating a
+complete, contiguous set in numeric order. An EWF image
 is a segmented, compressed Expert Witness container. Hasher keeps these concepts separate:
 
 - **Container hash:** hashes only the selected compressed EWF segment byte-for-byte.
@@ -105,8 +107,11 @@ is a segmented, compressed Expert Witness container. Hasher keeps these concepts
 - **Evidence-stream hash:** hashes the decompressed/reconstructed media across the
   complete discovered EWF segment set. Hasher computes ADLER32, CRC32, MD5,
   SHA-1 and SHA-256 over that logical stream in one pass.
+- **Numbered raw-stream hash:** hashes `.001` onward as one logical stream.
+  Hasher refuses reconstruction when `.001` or an intermediate segment is
+  missing, while selected-file mode remains available for hashing one segment.
 
-EWF files default to evidence-stream mode. The GUI shows stored acquisition digests,
+EWF and numbered raw files default to evidence-stream mode. The GUI shows stored acquisition digests,
 MATCH/MISMATCH results, logical media geometry, populated case fields and recorded
 acquisition read-error ranges. Container-segment mode remains available when that
 specific provenance value is needed.

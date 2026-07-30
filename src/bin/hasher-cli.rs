@@ -3,7 +3,8 @@ use clap::{Parser, Subcommand};
 use hasher::{
     Algorithm, ManifestEntry, ManifestFormat, VerifyOutcome, build_report,
     collect_files_recursively, format_manifest, format_results, hash_bytes, hash_ewf_media,
-    hash_file, inspect_file, is_ewf_path, read_hash_list, read_manifest,
+    hash_file, hash_raw_media, inspect_file, is_ewf_path, is_raw_segment_path, read_hash_list,
+    read_manifest,
 };
 use std::{
     fs,
@@ -46,6 +47,14 @@ enum Command {
     },
     /// Reconstruct and hash the logical media stream across a complete EWF/E01 set.
     Ewf {
+        path: PathBuf,
+        #[arg(short, long, default_value = "all")]
+        algorithm: String,
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    /// Reconstruct and hash a complete contiguous `.001`, `.002`, ... raw set.
+    Raw {
         path: PathBuf,
         #[arg(short, long, default_value = "all")]
         algorithm: String,
@@ -110,6 +119,8 @@ fn run_verify(expected: &str, file: Option<PathBuf>, text: Option<String>) -> Re
         (Some(path), _) => {
             if is_ewf_path(&path) {
                 hash_ewf_media(&path)?.results
+            } else if is_raw_segment_path(&path) {
+                hash_raw_media(&path)?.results
             } else {
                 hash_file(&path)?
             }
@@ -280,6 +291,16 @@ fn main() -> Result<ExitCode> {
                     eprintln!("Stored {} {}: {status}", stored.algorithm, stored.value);
                 }
             }
+            let rendered = format_results(&selected(analysis.results, &algorithm)?);
+            emit(&rendered, output)?;
+            ExitCode::SUCCESS
+        }
+        Command::Raw {
+            path,
+            algorithm,
+            output,
+        } => {
+            let analysis = hash_raw_media(path)?;
             let rendered = format_results(&selected(analysis.results, &algorithm)?);
             emit(&rendered, output)?;
             ExitCode::SUCCESS
