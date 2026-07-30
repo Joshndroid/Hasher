@@ -7,14 +7,18 @@ use eframe::egui::{
 };
 use hasher::{
     Algorithm, FileInspection, HashResult, VerifyOutcome, VerifyReport, build_report,
-    detect_expected_algorithm, format_results, hash_bytes, hash_ewf_media, hash_file, inspect_file,
-    is_ewf_path, normalise_expected_hash, read_hash_list,
+    detect_expected_algorithm, format_results, hash_bytes, hash_ewf_media_with_progress,
+    hash_file_with_progress, inspect_file, is_ewf_path, normalise_expected_hash, read_hash_list,
 };
 use std::{
     cmp::Ordering,
     fs,
     path::PathBuf,
-    sync::mpsc::{self, Receiver},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+        mpsc::{self, Receiver},
+    },
     time::Duration,
 };
 
@@ -64,6 +68,16 @@ enum WorkResult {
         Box<anyhow::Result<(Vec<HashResult>, FileInspection)>>,
     ),
     Verified(anyhow::Result<Vec<HashResult>>),
+}
+
+enum FileMessage {
+    Progress(u64, u64),
+    Finished(WorkResult),
+}
+
+enum VerifyMessage {
+    Progress(u64, u64),
+    Finished(WorkResult),
 }
 
 #[derive(Clone)]
@@ -234,13 +248,32 @@ fn contrast_ratio(a: Color32, b: Color32) -> f32 {
     (hi + 0.05) / (lo + 0.05)
 }
 
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 /// One file's result inside a multi-file batch.
 struct BatchEntry {
     path: PathBuf,
     result: anyhow::Result<Vec<HashResult>>,
 }
 
-type BatchMessage = (PathBuf, Box<anyhow::Result<Vec<HashResult>>>);
+enum BatchMessage {
+    Progress(u64, u64),
+    Finished(PathBuf, Box<anyhow::Result<Vec<HashResult>>>),
+    Cancelled,
+}
 
 struct HasherApp {
     custom_chrome: bool,
@@ -268,8 +301,10 @@ struct HasherApp {
     verifying: bool,
     status: String,
     working: bool,
-    file_receiver: Option<Receiver<WorkResult>>,
-    verify_receiver: Option<Receiver<WorkResult>>,
+    progress: Option<(u64, u64)>,
+    cancel: Option<Arc<AtomicBool>>,
+    file_receiver: Option<Receiver<FileMessage>>,
+    verify_receiver: Option<Receiver<VerifyMessage>>,
     batch_receiver: Option<Receiver<BatchMessage>>,
     update_state: UpdateState,
     update_receiver: Option<Receiver<anyhow::Result<UpdateInfo>>>,
@@ -310,6 +345,8 @@ impl Default for HasherApp {
             verifying: false,
             status: "Ready".into(),
             working: false,
+            progress: None,
+            cancel: None,
             file_receiver: None,
             verify_receiver: None,
             batch_receiver: None,
@@ -563,6 +600,43 @@ fn grip_handle(pal: Palette, ui: &mut egui::Ui) -> egui::Response {
 }
 
 impl HasherApp {
+    fn request_cancel(&mut self) {
+        if let Some(cancel) = &self.cancel {
+            cancel.store(true, AtomicOrdering::Relaxed);
+            self.status = "Cancelling after the current block…".into();
+        }
+    }
+
+    fn progress_ui(&mut self, ui: &mut egui::Ui) {
+        let pal = self.pal;
+        let (processed, total) = self.progress.unwrap_or((0, 0));
+        ui.horizontal(|ui| {
+            if total > 0 {
+                let fraction = (processed as f64 / total as f64).clamp(0.0, 1.0) as f32;
+                let text = format!(
+                    "{} / {} ({:.1}%)",
+                    format_bytes(processed),
+                    format_bytes(total),
+                    fraction * 100.0
+                );
+                ui.add(
+                    egui::ProgressBar::new(fraction)
+                        .text(text)
+                        .desired_width((ui.available_width() - 80.0).max(120.0)),
+                );
+            } else {
+                ui.add(egui::Spinner::new().color(pal.accent));
+                ui.label(
+                    RichText::new(format!("{} processed", format_bytes(processed)))
+                        .color(pal.text_muted),
+                );
+            }
+            if ui.button("Cancel").clicked() {
+                self.request_cancel();
+            }
+        });
+    }
+
     fn with_custom_chrome(custom_chrome: bool) -> Self {
         Self {
             custom_chrome,
@@ -762,6 +836,9 @@ impl HasherApp {
         self.results_source = None;
         self.inspection = None;
         self.working = true;
+        self.progress = Some((0, 0));
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancel = Some(cancel.clone());
         self.status = match mode {
             FileHashMode::EvidenceStream => {
                 format!(
@@ -774,14 +851,34 @@ impl HasherApp {
         let (sender, receiver) = mpsc::channel();
         self.file_receiver = Some(receiver);
         std::thread::spawn(move || {
+            let total = match mode {
+                FileHashMode::EvidenceStream => inspect_file(&path)
+                    .ok()
+                    .and_then(|info| info.ewf.map(|ewf| ewf.media_size))
+                    .unwrap_or(0),
+                FileHashMode::ContainerFile => fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+            };
+            let progress_sender = sender.clone();
+            let progress_ctx = ctx.clone();
+            let mut report_progress = move |processed| {
+                let keep_going = !cancel.load(AtomicOrdering::Relaxed);
+                let _ = progress_sender.send(FileMessage::Progress(processed, total));
+                progress_ctx.request_repaint();
+                keep_going
+            };
             let result = match mode {
                 FileHashMode::EvidenceStream => {
-                    hash_ewf_media(&path).map(|analysis| (analysis.results, analysis.inspection))
+                    hash_ewf_media_with_progress(&path, &mut report_progress)
+                        .map(|analysis| (analysis.results, analysis.inspection))
                 }
-                FileHashMode::ContainerFile => hash_file(&path)
+                FileHashMode::ContainerFile => hash_file_with_progress(&path, &mut report_progress)
                     .and_then(|hashes| inspect_file(&path).map(|info| (hashes, info))),
             };
-            let _ = sender.send(WorkResult::Hashed(path, mode, Box::new(result)));
+            let _ = sender.send(FileMessage::Finished(WorkResult::Hashed(
+                path,
+                mode,
+                Box::new(result),
+            )));
             ctx.request_repaint();
         });
     }
@@ -795,17 +892,48 @@ impl HasherApp {
         self.batch.clear();
         self.batch_pending = paths.len();
         self.working = true;
+        self.progress = Some((0, 0));
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancel = Some(cancel.clone());
         self.status = format!("Hashing {} files…", paths.len());
         let (sender, receiver) = mpsc::channel();
         self.batch_receiver = Some(receiver);
         std::thread::spawn(move || {
             for path in paths {
-                let result = if is_ewf_path(&path) {
-                    hash_ewf_media(&path).map(|analysis| analysis.results)
+                if cancel.load(AtomicOrdering::Relaxed) {
+                    let _ = sender.send(BatchMessage::Cancelled);
+                    ctx.request_repaint();
+                    return;
+                }
+                let ewf = is_ewf_path(&path);
+                let total = if ewf {
+                    inspect_file(&path)
+                        .ok()
+                        .and_then(|info| info.ewf.map(|details| details.media_size))
+                        .unwrap_or(0)
                 } else {
-                    hash_file(&path)
+                    fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
                 };
-                let _ = sender.send((path, Box::new(result)));
+                let progress_sender = sender.clone();
+                let progress_ctx = ctx.clone();
+                let mut report_progress = |processed| {
+                    let keep_going = !cancel.load(AtomicOrdering::Relaxed);
+                    let _ = progress_sender.send(BatchMessage::Progress(processed, total));
+                    progress_ctx.request_repaint();
+                    keep_going
+                };
+                let result = if ewf {
+                    hash_ewf_media_with_progress(&path, &mut report_progress)
+                        .map(|analysis| analysis.results)
+                } else {
+                    hash_file_with_progress(&path, &mut report_progress)
+                };
+                if cancel.load(AtomicOrdering::Relaxed) {
+                    let _ = sender.send(BatchMessage::Cancelled);
+                    ctx.request_repaint();
+                    return;
+                }
+                let _ = sender.send(BatchMessage::Finished(path, Box::new(result)));
                 ctx.request_repaint();
             }
         });
@@ -814,17 +942,38 @@ impl HasherApp {
     fn begin_verify_file(&mut self, path: PathBuf, ctx: egui::Context) {
         self.verify_file = path.display().to_string();
         self.verifying = true;
+        self.progress = Some((0, 0));
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancel = Some(cancel.clone());
         self.verify_report = None;
         self.status = format!("Hashing {} for verification…", path.display());
         let (sender, receiver) = mpsc::channel();
         self.verify_receiver = Some(receiver);
         std::thread::spawn(move || {
-            let result = if is_ewf_path(&path) {
-                hash_ewf_media(&path).map(|analysis| analysis.results)
+            let ewf = is_ewf_path(&path);
+            let total = if ewf {
+                inspect_file(&path)
+                    .ok()
+                    .and_then(|info| info.ewf.map(|details| details.media_size))
+                    .unwrap_or(0)
             } else {
-                hash_file(&path)
+                fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
             };
-            let _ = sender.send(WorkResult::Verified(result));
+            let progress_sender = sender.clone();
+            let progress_ctx = ctx.clone();
+            let mut report_progress = |processed| {
+                let keep_going = !cancel.load(AtomicOrdering::Relaxed);
+                let _ = progress_sender.send(VerifyMessage::Progress(processed, total));
+                progress_ctx.request_repaint();
+                keep_going
+            };
+            let result = if ewf {
+                hash_ewf_media_with_progress(&path, &mut report_progress)
+                    .map(|analysis| analysis.results)
+            } else {
+                hash_file_with_progress(&path, &mut report_progress)
+            };
+            let _ = sender.send(VerifyMessage::Finished(WorkResult::Verified(result)));
             ctx.request_repaint();
         });
     }
@@ -838,13 +987,32 @@ impl HasherApp {
 
     fn poll_work(&mut self) {
         // Single-file hashing.
-        if let Some(WorkResult::Hashed(path, mode, result)) = self
+        let mut file_finished = None;
+        while let Some(message) = self
             .file_receiver
             .as_ref()
             .and_then(|receiver| receiver.try_recv().ok())
         {
+            match message {
+                FileMessage::Progress(processed, total) => {
+                    self.progress = Some((processed, total));
+                }
+                FileMessage::Finished(result) => file_finished = Some(result),
+            }
+        }
+        if let Some(WorkResult::Hashed(path, mode, result)) = file_finished {
+            let cancelled = self
+                .cancel
+                .as_ref()
+                .is_some_and(|cancel| cancel.load(AtomicOrdering::Relaxed));
             self.file_receiver = None;
             self.working = false;
+            self.progress = None;
+            self.cancel = None;
+            if cancelled {
+                self.status = "Hashing cancelled".into();
+                return;
+            }
             match *result {
                 Ok((hashes, info)) => {
                     self.results = hashes;
@@ -872,13 +1040,32 @@ impl HasherApp {
         }
 
         // Verification hashing.
-        if let Some(WorkResult::Verified(result)) = self
+        let mut verify_finished = None;
+        while let Some(message) = self
             .verify_receiver
             .as_ref()
             .and_then(|receiver| receiver.try_recv().ok())
         {
+            match message {
+                VerifyMessage::Progress(processed, total) => {
+                    self.progress = Some((processed, total));
+                }
+                VerifyMessage::Finished(result) => verify_finished = Some(result),
+            }
+        }
+        if let Some(WorkResult::Verified(result)) = verify_finished {
+            let cancelled = self
+                .cancel
+                .as_ref()
+                .is_some_and(|cancel| cancel.load(AtomicOrdering::Relaxed));
             self.verify_receiver = None;
             self.verifying = false;
+            self.progress = None;
+            self.cancel = None;
+            if cancelled {
+                self.status = "Verification cancelled".into();
+                return;
+            }
             match result {
                 Ok(hashes) => {
                     let report = build_report(&self.verify_expected, &hashes);
@@ -896,20 +1083,40 @@ impl HasherApp {
         if self.batch_receiver.is_none() {
             return;
         }
-        while let Some((path, result)) = self
+        let mut cancelled = false;
+        while let Some(message) = self
             .batch_receiver
             .as_ref()
             .and_then(|receiver| receiver.try_recv().ok())
         {
-            self.batch.push(BatchEntry {
-                path,
-                result: *result,
-            });
-            self.batch_pending = self.batch_pending.saturating_sub(1);
+            match message {
+                BatchMessage::Progress(processed, total) => {
+                    self.progress = Some((processed, total));
+                }
+                BatchMessage::Finished(path, result) => {
+                    self.batch.push(BatchEntry {
+                        path,
+                        result: *result,
+                    });
+                    self.batch_pending = self.batch_pending.saturating_sub(1);
+                }
+                BatchMessage::Cancelled => cancelled = true,
+            }
+        }
+        if cancelled {
+            self.batch_receiver = None;
+            self.batch_pending = 0;
+            self.working = false;
+            self.progress = None;
+            self.cancel = None;
+            self.status = format!("Hashing cancelled · {} file(s) completed", self.batch.len());
+            return;
         }
         if self.batch_pending == 0 {
             self.batch_receiver = None;
             self.working = false;
+            self.progress = None;
+            self.cancel = None;
             let failed = self.batch.iter().filter(|e| e.result.is_err()).count();
             self.status = if failed == 0 {
                 format!("Hashed {} files", self.batch.len())
@@ -1390,7 +1597,7 @@ impl eframe::App for HasherApp {
                 .filter_map(|f| f.path.clone())
                 .collect()
         });
-        if !dropped.is_empty() {
+        if !dropped.is_empty() && !self.working && !self.verifying {
             self.page = Page::File;
             self.dispatch_paths(dropped, ctx.clone());
         }
@@ -1408,7 +1615,7 @@ impl eframe::App for HasherApp {
                 let problem = self.status.starts_with("Error")
                     || self.status.contains("failed")
                     || self.status.contains("MISMATCH");
-                let (dot, state) = if self.working {
+                let (dot, state) = if self.working || self.verifying {
                     (pal.warn, "Working")
                 } else if problem {
                     (pal.danger, "Attention")
@@ -1553,7 +1760,10 @@ impl HasherApp {
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui
-                        .add_enabled(!self.working, egui::Button::new("Choose"))
+                        .add_enabled(
+                            !self.working && !self.verifying,
+                            egui::Button::new("Choose"),
+                        )
                         .clicked()
                         && let Some(paths) = rfd::FileDialog::new().pick_files()
                     {
@@ -1580,7 +1790,10 @@ impl HasherApp {
                 );
                 ui.add_space(6.0);
                 if ui
-                    .add_enabled(!self.working, egui::Button::new("Hash again"))
+                    .add_enabled(
+                        !self.working && !self.verifying,
+                        egui::Button::new("Hash again"),
+                    )
                     .clicked()
                 {
                     self.begin_file_hash(
@@ -1594,10 +1807,7 @@ impl HasherApp {
 
         if self.working {
             ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.add(egui::Spinner::new().color(pal.accent));
-                ui.label(RichText::new("Working…").color(pal.text_muted));
-            });
+            self.progress_ui(ui);
         }
 
         if !self.batch.is_empty() {
@@ -1792,7 +2002,10 @@ impl HasherApp {
                         );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if ui
-                                .add_enabled(!self.verifying, egui::Button::new("Choose"))
+                                .add_enabled(
+                                    !self.verifying && !self.working,
+                                    egui::Button::new("Choose"),
+                                )
                                 .clicked()
                                 && let Some(path) = rfd::FileDialog::new().pick_file()
                             {
@@ -1810,7 +2023,7 @@ impl HasherApp {
         ui.horizontal(|ui| {
             let verify = ui
                 .add_enabled(
-                    !self.verifying,
+                    !self.verifying && !self.working,
                     egui::Button::new(RichText::new("Verify").strong().color(pal.text))
                         .min_size(Vec2::new(100.0, 30.0))
                         .fill(pal.accent.gamma_multiply(0.30))
@@ -1831,8 +2044,7 @@ impl HasherApp {
             }
             if self.verifying {
                 ui.add_space(8.0);
-                ui.add(egui::Spinner::new().color(pal.accent));
-                ui.label(RichText::new("Hashing…").color(pal.text_muted));
+                self.progress_ui(ui);
             }
         });
 

@@ -116,22 +116,55 @@ pub fn hash_bytes(bytes: &[u8]) -> Vec<HashResult> {
 }
 
 pub fn hash_reader(mut reader: impl Read) -> io::Result<Vec<HashResult>> {
+    hash_reader_with_progress(&mut reader, |_| true)
+}
+
+/// Hashes a stream while reporting the number of bytes consumed.
+///
+/// Returning `false` from `progress` cooperatively cancels the operation. The
+/// callback runs after each read (currently every MiB), so callers can update a
+/// UI and stop large hashes without waiting for the whole stream.
+pub fn hash_reader_with_progress(
+    mut reader: impl Read,
+    mut progress: impl FnMut(u64) -> bool,
+) -> io::Result<Vec<HashResult>> {
     let mut hasher = MultiHasher::new();
     let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut processed = 0_u64;
     loop {
+        if !progress(processed) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "hashing cancelled",
+            ));
+        }
         let count = reader.read(&mut buffer)?;
         if count == 0 {
             break;
         }
         hasher.update(&buffer[..count]);
+        processed = processed.saturating_add(count as u64);
+    }
+    if !progress(processed) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "hashing cancelled",
+        ));
     }
     Ok(hasher.finish())
 }
 
 pub fn hash_file(path: impl AsRef<Path>) -> Result<Vec<HashResult>> {
+    hash_file_with_progress(path, |_| true)
+}
+
+pub fn hash_file_with_progress(
+    path: impl AsRef<Path>,
+    progress: impl FnMut(u64) -> bool,
+) -> Result<Vec<HashResult>> {
     let path = path.as_ref();
     let file = File::open(path).with_context(|| format!("could not open {}", path.display()))?;
-    hash_reader(BufReader::with_capacity(1024 * 1024, file))
+    hash_reader_with_progress(BufReader::with_capacity(1024 * 1024, file), progress)
         .with_context(|| format!("could not read {}", path.display()))
 }
 
@@ -397,9 +430,17 @@ fn open_ewf_details(path: &Path) -> Result<(ewf::EwfReader, EwfDetails, Vec<Hash
 /// Hashes the logical evidence stream reconstructed from every EWF segment.
 /// The returned MD5/SHA-1 can be compared with acquisition digests stored in the image.
 pub fn hash_ewf_media(path: impl AsRef<Path>) -> Result<EwfAnalysis> {
+    hash_ewf_media_with_progress(path, |_| true)
+}
+
+pub fn hash_ewf_media_with_progress(
+    path: impl AsRef<Path>,
+    progress: impl FnMut(u64) -> bool,
+) -> Result<EwfAnalysis> {
     let path = path.as_ref();
     let (reader, details, embedded_hashes) = open_ewf_details(path)?;
-    let results = hash_reader(reader).context("could not decode the EWF evidence stream")?;
+    let results = hash_reader_with_progress(reader, progress)
+        .context("could not decode the EWF evidence stream")?;
     let inspection = ewf_inspection(path, details, embedded_hashes)?;
     Ok(EwfAnalysis {
         results,
@@ -572,6 +613,20 @@ mod tests {
             got[3].value,
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn progress_callback_can_cancel_hashing() {
+        let input = vec![0_u8; 2 * 1024 * 1024];
+        let mut reports = Vec::new();
+        let error = hash_reader_with_progress(input.as_slice(), |processed| {
+            reports.push(processed);
+            processed < 1024 * 1024
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(reports, vec![0, 1024 * 1024]);
     }
 
     #[test]
