@@ -110,6 +110,9 @@ is a segmented, compressed Expert Witness container. Hasher keeps these concepts
 - **Numbered raw-stream hash:** hashes `.001` onward as one logical stream.
   Hasher refuses reconstruction when `.001` or an intermediate segment is
   missing, while selected-file mode remains available for hashing one segment.
+- **Sidecar hash:** a value parsed from an adjacent `.txt` or `.log` file.
+  Sidecar values are reported separately and are never presented as digests
+  embedded in the evidence container.
 
 EWF and numbered raw files default to evidence-stream mode. The GUI shows stored acquisition digests,
 MATCH/MISMATCH results, logical media geometry, populated case fields and recorded

@@ -1569,27 +1569,27 @@ impl HasherApp {
                 );
 
                 ui.add_space(8.0);
-                if ewf.stored_hashes.is_empty() {
+                if info.embedded_hashes.is_empty() {
                     ui.label(
                         RichText::new("No acquisition digest is stored in this image.")
                             .color(pal.text_muted),
                     );
                 } else {
                     ui.label(
-                        RichText::new("Stored acquisition digests")
+                        RichText::new("Embedded acquisition digests")
                             .strong()
                             .color(pal.text),
                     );
                     ui.add_space(4.0);
-                    for stored in &ewf.stored_hashes {
+                    for embedded in &info.embedded_hashes {
                         let computed = self
                             .results
                             .iter()
-                            .find(|result| result.algorithm == stored.algorithm);
+                            .find(|result| result.algorithm == embedded.algorithm);
                         let (label, color) = if self.file_hash_mode == FileHashMode::EvidenceStream
                         {
                             match computed {
-                                Some(result) if result.value == stored.value => {
+                                Some(result) if result.value == embedded.value => {
                                     ("✓ MATCH", pal.success)
                                 }
                                 Some(_) => ("✗ MISMATCH", pal.danger),
@@ -1604,11 +1604,11 @@ impl HasherApp {
                             .inner_margin(Margin::symmetric(10, 7))
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
-                                    chip(pal, ui, &stored.algorithm.to_string(), pal.text_muted);
+                                    chip(pal, ui, &embedded.algorithm.to_string(), pal.text_muted);
                                     ui.add_space(4.0);
                                     ui.add(
                                         egui::Label::new(
-                                            RichText::new(&stored.value)
+                                            RichText::new(&embedded.value)
                                                 .monospace()
                                                 .size(12.0)
                                                 .color(pal.text),
@@ -1653,15 +1653,37 @@ impl HasherApp {
                         .color(pal.warn),
                     );
                 }
-            } else if !info.embedded_hashes.is_empty() {
-                ui.add_space(6.0);
+            }
+
+            if !info.sidecar_hashes.is_empty() {
+                ui.add_space(8.0);
                 ui.label(
-                    RichText::new(format!(
-                        "{} sidecar hash value(s) discovered",
-                        info.embedded_hashes.len()
-                    ))
-                    .color(pal.text),
+                    RichText::new("Sidecar hash values")
+                        .strong()
+                        .color(pal.text),
                 );
+                ui.label(
+                    RichText::new("Parsed from an adjacent .txt or .log file; not embedded in the evidence image.")
+                        .color(pal.text_muted)
+                        .size(12.0),
+                );
+                ui.add_space(4.0);
+                for sidecar in &info.sidecar_hashes {
+                    ui.horizontal(|ui| {
+                        chip(pal, ui, &sidecar.algorithm.to_string(), pal.text_muted);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&sidecar.value)
+                                    .monospace()
+                                    .size(12.0)
+                                    .color(pal.text),
+                            )
+                            .selectable(true)
+                            .wrap(),
+                        );
+                    });
+                    ui.add_space(3.0);
+                }
             }
         });
     }

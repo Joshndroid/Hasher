@@ -275,21 +275,22 @@ fn main() -> Result<ExitCode> {
             output,
         } => {
             let analysis = hash_ewf_media(path)?;
-            if let Some(ewf) = &analysis.inspection.ewf {
-                for stored in &ewf.stored_hashes {
-                    let status = analysis
-                        .results
-                        .iter()
-                        .find(|computed| computed.algorithm == stored.algorithm)
-                        .map_or("NOT COMPUTED", |computed| {
-                            if computed.value == stored.value {
-                                "MATCH"
-                            } else {
-                                "MISMATCH"
-                            }
-                        });
-                    eprintln!("Stored {} {}: {status}", stored.algorithm, stored.value);
-                }
+            for embedded in &analysis.inspection.embedded_hashes {
+                let status = analysis
+                    .results
+                    .iter()
+                    .find(|computed| computed.algorithm == embedded.algorithm)
+                    .map_or("NOT COMPUTED", |computed| {
+                        if computed.value == embedded.value {
+                            "MATCH"
+                        } else {
+                            "MISMATCH"
+                        }
+                    });
+                eprintln!(
+                    "Embedded acquisition digest {} {}: {status}",
+                    embedded.algorithm, embedded.value
+                );
             }
             let rendered = format_results(&selected(analysis.results, &algorithm)?);
             emit(&rendered, output)?;
@@ -323,8 +324,14 @@ fn main() -> Result<ExitCode> {
             );
             if !info.embedded_hashes.is_empty() {
                 println!(
-                    "Stored/sidecar hashes:\n{}",
+                    "Embedded acquisition digests:\n{}",
                     format_results(&info.embedded_hashes)
+                );
+            }
+            if !info.sidecar_hashes.is_empty() {
+                println!(
+                    "Sidecar hashes (.txt/.log):\n{}",
+                    format_results(&info.sidecar_hashes)
                 );
             }
             if let Some(ewf) = info.ewf {

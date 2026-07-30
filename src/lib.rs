@@ -625,7 +625,10 @@ pub struct FileInspection {
     pub kind: EvidenceKind,
     pub size: u64,
     pub segment_count: usize,
+    /// Digests stored inside the inspected evidence container.
     pub embedded_hashes: Vec<HashResult>,
+    /// Digests parsed from adjacent `.txt` or `.log` files.
+    pub sidecar_hashes: Vec<HashResult>,
     pub ewf: Option<EwfDetails>,
     pub note: String,
 }
@@ -636,7 +639,6 @@ pub struct EwfDetails {
     pub media_size: u64,
     pub chunk_size: u64,
     pub chunk_count: usize,
-    pub stored_hashes: Vec<HashResult>,
     pub metadata: Vec<(String, String)>,
     pub acquisition_errors: Vec<(u32, u32)>,
 }
@@ -732,7 +734,6 @@ fn open_ewf_details(path: &Path) -> Result<(ewf::EwfReader, EwfDetails, Vec<Hash
         media_size: reader.total_size(),
         chunk_size: reader.chunk_size(),
         chunk_count: reader.chunk_count(),
-        stored_hashes: embedded_hashes.clone(),
         metadata,
         acquisition_errors,
     };
@@ -896,14 +897,9 @@ pub fn hash_raw_media_with_progress(
 fn ewf_inspection(
     path: &Path,
     details: EwfDetails,
-    mut embedded_hashes: Vec<HashResult>,
+    embedded_hashes: Vec<HashResult>,
 ) -> Result<FileInspection> {
-    let sidecar = read_sidecar_hashes(path)?;
-    for hash in sidecar {
-        if !embedded_hashes.contains(&hash) {
-            embedded_hashes.push(hash);
-        }
-    }
+    let sidecar_hashes = read_sidecar_hashes(path)?;
     let metadata = path
         .metadata()
         .with_context(|| format!("could not inspect {}", path.display()))?;
@@ -913,6 +909,7 @@ fn ewf_inspection(
         size: metadata.len(),
         segment_count: count_segments(path, EvidenceKind::ExpertWitness),
         embedded_hashes,
+        sidecar_hashes,
         note: "EWF metadata and stored acquisition digests were decoded. Evidence-stream hashing reconstructs and hashes the logical media across the complete segment set.".into(),
         ewf: Some(details),
     })
@@ -948,7 +945,7 @@ pub fn inspect_file(path: impl AsRef<Path>) -> Result<FileInspection> {
         let (_reader, details, embedded_hashes) = open_ewf_details(path)?;
         return ewf_inspection(path, details, embedded_hashes);
     }
-    let sidecar = read_sidecar_hashes(path)?;
+    let sidecar_hashes = read_sidecar_hashes(path)?;
     let note = match kind {
         EvidenceKind::ExpertWitness => unreachable!(),
         EvidenceKind::RawSegment => match raw_segment_paths(path) {
@@ -963,7 +960,8 @@ pub fn inspect_file(path: impl AsRef<Path>) -> Result<FileInspection> {
         kind,
         size: metadata.len(),
         segment_count,
-        embedded_hashes: sidecar,
+        embedded_hashes: Vec::new(),
+        sidecar_hashes,
         ewf: None,
         note,
     })
@@ -1113,11 +1111,24 @@ mod tests {
         let first = directory.join("evidence.001");
         fs::write(&first, b"ab").unwrap();
         fs::write(directory.join("evidence.002"), b"c").unwrap();
+        fs::write(
+            directory.join("evidence.txt"),
+            "MD5: 900150983cd24fb0d6963f7d28e17f72",
+        )
+        .unwrap();
 
         let analysis = hash_raw_media(&first).unwrap();
         assert_eq!(analysis.results, hash_bytes(b"abc"));
         assert_eq!(analysis.media_size, 3);
         assert_eq!(analysis.inspection.segment_count, 2);
+        assert!(analysis.inspection.embedded_hashes.is_empty());
+        assert_eq!(
+            analysis.inspection.sidecar_hashes,
+            vec![HashResult {
+                algorithm: Algorithm::Md5,
+                value: "900150983cd24fb0d6963f7d28e17f72".into(),
+            }]
+        );
 
         fs::remove_dir_all(directory).unwrap();
     }
