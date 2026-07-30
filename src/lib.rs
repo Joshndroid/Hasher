@@ -10,8 +10,8 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::{
     fmt::{self, Display},
-    fs::File,
-    io::{self, BufRead, BufReader, Read},
+    fs::{self, File},
+    io::{self, BufReader, Read},
     path::{Path, PathBuf},
 };
 
@@ -21,10 +21,17 @@ pub enum Algorithm {
     Md5,
     Sha1,
     Sha256,
+    Crc32,
 }
 
 impl Algorithm {
-    pub const ALL: [Self; 4] = [Self::Adler32, Self::Md5, Self::Sha1, Self::Sha256];
+    pub const ALL: [Self; 5] = [
+        Self::Adler32,
+        Self::Md5,
+        Self::Sha1,
+        Self::Sha256,
+        Self::Crc32,
+    ];
 
     pub fn parse(value: &str) -> Result<Self> {
         match value.to_ascii_lowercase().replace('-', "").as_str() {
@@ -32,13 +39,14 @@ impl Algorithm {
             "md5" => Ok(Self::Md5),
             "sha1" => Ok(Self::Sha1),
             "sha256" => Ok(Self::Sha256),
+            "crc32" => Ok(Self::Crc32),
             _ => bail!("unsupported algorithm: {value}"),
         }
     }
 
     pub fn hex_len(self) -> usize {
         match self {
-            Self::Adler32 => 8,
+            Self::Adler32 | Self::Crc32 => 8,
             Self::Md5 => 32,
             Self::Sha1 => 40,
             Self::Sha256 => 64,
@@ -53,6 +61,7 @@ impl Display for Algorithm {
             Self::Md5 => "MD5",
             Self::Sha1 => "SHA-1",
             Self::Sha256 => "SHA-256",
+            Self::Crc32 => "CRC32",
         })
     }
 }
@@ -68,7 +77,30 @@ struct MultiHasher {
     md5: Md5,
     sha1: Sha1,
     sha256: Sha256,
+    crc32: u32,
 }
+
+const fn crc32_table() -> [u32; 256] {
+    let mut table = [0_u32; 256];
+    let mut index = 0;
+    while index < table.len() {
+        let mut value = index as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            value = if value & 1 == 1 {
+                0xedb8_8320 ^ (value >> 1)
+            } else {
+                value >> 1
+            };
+            bit += 1;
+        }
+        table[index] = value;
+        index += 1;
+    }
+    table
+}
+
+const CRC32_TABLE: [u32; 256] = crc32_table();
 
 impl MultiHasher {
     fn new() -> Self {
@@ -77,6 +109,7 @@ impl MultiHasher {
             md5: Md5::new(),
             sha1: Sha1::new(),
             sha256: Sha256::new(),
+            crc32: u32::MAX,
         }
     }
 
@@ -85,6 +118,10 @@ impl MultiHasher {
         self.md5.update(bytes);
         self.sha1.update(bytes);
         self.sha256.update(bytes);
+        for byte in bytes {
+            let index = ((self.crc32 ^ u32::from(*byte)) & 0xff) as usize;
+            self.crc32 = CRC32_TABLE[index] ^ (self.crc32 >> 8);
+        }
     }
 
     fn finish(self) -> Vec<HashResult> {
@@ -104,6 +141,10 @@ impl MultiHasher {
             HashResult {
                 algorithm: Algorithm::Sha256,
                 value: hex::encode(self.sha256.finalize()),
+            },
+            HashResult {
+                algorithm: Algorithm::Crc32,
+                value: format!("{:08x}", !self.crc32),
             },
         ]
     }
@@ -177,6 +218,225 @@ pub fn format_results(results: &[HashResult]) -> String {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManifestFormat {
+    Gnu,
+    Bsd,
+    Sfv,
+}
+
+impl ManifestFormat {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "gnu" | "coreutils" | "sha256sums" => Ok(Self::Gnu),
+            "bsd" => Ok(Self::Bsd),
+            "sfv" => Ok(Self::Sfv),
+            _ => bail!("unsupported manifest format: {value} (expected gnu, bsd, or sfv)"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManifestEntry {
+    pub path: PathBuf,
+    pub hash: HashResult,
+}
+
+/// Recursively collects regular files below `root` in stable path order.
+/// Directory symlinks are not followed.
+pub fn collect_files_recursively(root: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
+    fn visit(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+        let metadata = path
+            .symlink_metadata()
+            .with_context(|| format!("could not inspect {}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            return Ok(());
+        }
+        if metadata.is_file() {
+            files.push(path.to_path_buf());
+            return Ok(());
+        }
+        if !metadata.is_dir() {
+            return Ok(());
+        }
+
+        let mut children = fs::read_dir(path)
+            .with_context(|| format!("could not read directory {}", path.display()))?
+            .collect::<io::Result<Vec<_>>>()
+            .with_context(|| format!("could not enumerate directory {}", path.display()))?;
+        children.sort_by_key(|entry| entry.file_name());
+        for child in children {
+            visit(&child.path(), files)?;
+        }
+        Ok(())
+    }
+
+    let root = root.as_ref();
+    let mut files = Vec::new();
+    visit(root, &mut files)?;
+    Ok(files)
+}
+
+fn algorithm_from_digest(value: &str) -> Option<Algorithm> {
+    if !value.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    match value.len() {
+        8 => Some(Algorithm::Adler32),
+        32 => Some(Algorithm::Md5),
+        40 => Some(Algorithm::Sha1),
+        64 => Some(Algorithm::Sha256),
+        _ => None,
+    }
+}
+
+fn unescape_gnu_path(value: &str) -> String {
+    let mut output = String::new();
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next() {
+                Some('n') => output.push('\n'),
+                Some('\\') => output.push('\\'),
+                Some(other) => {
+                    output.push('\\');
+                    output.push(other);
+                }
+                None => output.push('\\'),
+            }
+        } else {
+            output.push(ch);
+        }
+    }
+    output
+}
+
+/// Parses GNU/coreutils, BSD checksum, and SFV-style manifest lines.
+pub fn parse_manifest(text: &str) -> Result<Vec<ManifestEntry>> {
+    let mut entries = Vec::new();
+    for (index, raw_line) in text.lines().enumerate() {
+        let line = raw_line.trim_end_matches('\r');
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
+            continue;
+        }
+
+        let parsed = if let Some((left, digest)) = line.rsplit_once(") = ") {
+            let (algorithm, path) = left.split_once(" (").context("invalid BSD checksum line")?;
+            let algorithm = Algorithm::parse(algorithm)?;
+            let digest = digest.trim();
+            if digest.len() != algorithm.hex_len() || !digest.chars().all(|c| c.is_ascii_hexdigit())
+            {
+                bail!("digest does not match {algorithm}");
+            }
+            Some(ManifestEntry {
+                path: PathBuf::from(path),
+                hash: HashResult {
+                    algorithm,
+                    value: digest.to_ascii_lowercase(),
+                },
+            })
+        } else {
+            let escaped = line.starts_with('\\');
+            let candidate = if escaped { &line[1..] } else { line };
+            let digest_end = candidate
+                .find(char::is_whitespace)
+                .unwrap_or(candidate.len());
+            let first = &candidate[..digest_end];
+            if let Some(algorithm) = algorithm_from_digest(first) {
+                let mut path = candidate[digest_end..].trim_start();
+                if let Some(binary_path) = path.strip_prefix('*') {
+                    path = binary_path;
+                }
+                if path.is_empty() {
+                    bail!("missing filename");
+                }
+                let path = if escaped {
+                    unescape_gnu_path(path)
+                } else {
+                    path.to_owned()
+                };
+                Some(ManifestEntry {
+                    path: PathBuf::from(path),
+                    hash: HashResult {
+                        algorithm,
+                        value: first.to_ascii_lowercase(),
+                    },
+                })
+            } else if let Some((path, digest)) = candidate.rsplit_once(char::is_whitespace) {
+                let digest = digest.trim();
+                if digest.len() != Algorithm::Crc32.hex_len()
+                    || !digest.chars().all(|c| c.is_ascii_hexdigit())
+                {
+                    bail!("SFV-style entries require an 8-hex digest");
+                }
+                Some(ManifestEntry {
+                    path: PathBuf::from(path.trim_end()),
+                    hash: HashResult {
+                        algorithm: Algorithm::Crc32,
+                        value: digest.to_ascii_lowercase(),
+                    },
+                })
+            } else {
+                None
+            }
+        };
+
+        match parsed {
+            Some(entry) if entry.path.as_os_str().is_empty() => {
+                bail!("manifest line {} has an empty filename", index + 1)
+            }
+            Some(entry) => entries.push(entry),
+            None => bail!("could not parse manifest line {}", index + 1),
+        }
+    }
+    if entries.is_empty() {
+        bail!("manifest contains no checksum entries");
+    }
+    Ok(entries)
+}
+
+pub fn read_manifest(path: impl AsRef<Path>) -> Result<Vec<ManifestEntry>> {
+    let path = path.as_ref();
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("could not read manifest {}", path.display()))?;
+    parse_manifest(&text)
+}
+
+pub fn format_manifest(entries: &[ManifestEntry], format: ManifestFormat) -> Result<String> {
+    let mut output = String::new();
+    for entry in entries {
+        let path = entry.path.to_string_lossy();
+        #[cfg(target_os = "windows")]
+        let path = path.replace('\\', "/");
+        #[cfg(not(target_os = "windows"))]
+        let path = path.into_owned();
+        match format {
+            ManifestFormat::Gnu => {
+                if path.contains('\\') || path.contains('\n') {
+                    let escaped = path.replace('\\', "\\\\").replace('\n', "\\n");
+                    output.push_str(&format!("\\{}  {escaped}\n", entry.hash.value));
+                } else {
+                    output.push_str(&format!("{}  {path}\n", entry.hash.value));
+                }
+            }
+            ManifestFormat::Bsd => {
+                output.push_str(&format!(
+                    "{} ({path}) = {}\n",
+                    entry.hash.algorithm, entry.hash.value
+                ));
+            }
+            ManifestFormat::Sfv => {
+                if entry.hash.algorithm != Algorithm::Crc32 {
+                    bail!("SFV output requires CRC32 results");
+                }
+                output.push_str(&format!("{path} {}\n", entry.hash.value));
+            }
+        }
+    }
+    Ok(output)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VerifyOutcome {
     Match,
     Mismatch,
@@ -216,6 +476,12 @@ pub fn normalise_expected_hash(expected_raw: &str) -> String {
 
 pub fn detect_expected_algorithm(expected_raw: &str) -> Option<Algorithm> {
     let expected = normalise_expected_hash(expected_raw);
+    if let Some(algorithm) = explicit_algorithm_label(expected_raw)
+        && expected.len() == algorithm.hex_len()
+        && expected.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Some(algorithm);
+    }
     expected
         .bytes()
         .all(|b| b.is_ascii_hexdigit())
@@ -227,10 +493,37 @@ pub fn detect_expected_algorithm(expected_raw: &str) -> Option<Algorithm> {
         .flatten()
 }
 
+fn explicit_algorithm_label(value: &str) -> Option<Algorithm> {
+    let trimmed = value.trim_start();
+    for (label, algorithm) in [
+        ("adler32", Algorithm::Adler32),
+        ("adler-32", Algorithm::Adler32),
+        ("crc32", Algorithm::Crc32),
+        ("crc-32", Algorithm::Crc32),
+        ("md5", Algorithm::Md5),
+        ("sha1", Algorithm::Sha1),
+        ("sha-1", Algorithm::Sha1),
+        ("sha256", Algorithm::Sha256),
+        ("sha-256", Algorithm::Sha256),
+    ] {
+        let Some(prefix) = trimmed.get(..label.len()) else {
+            continue;
+        };
+        let boundary = trimmed[label.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_ascii_alphanumeric());
+        if prefix.eq_ignore_ascii_case(label) && boundary {
+            return Some(algorithm);
+        }
+    }
+    None
+}
+
 fn strip_algorithm_label(value: &str) -> &str {
     let trimmed = value.trim_start();
     for label in [
-        "adler32", "adler-32", "md5", "sha1", "sha-1", "sha256", "sha-256",
+        "adler32", "adler-32", "crc32", "crc-32", "md5", "sha1", "sha-1", "sha256", "sha-256",
     ] {
         let Some(prefix) = trimmed.get(..label.len()) else {
             continue;
@@ -273,9 +566,9 @@ pub fn build_report(expected_raw: &str, computed_set: &[HashResult]) -> VerifyRe
         return report;
     }
 
-    let Some(algorithm) = detect_expected_algorithm(&expected) else {
+    let Some(algorithm) = detect_expected_algorithm(expected_raw) else {
         report.note = format!(
-            "{} hex characters doesn't match ADLER32 (8), MD5 (32), SHA-1 (40) or SHA-256 (64).",
+            "{} hex characters doesn't match ADLER32/CRC32 (8), MD5 (32), SHA-1 (40) or SHA-256 (64).",
             expected.len()
         );
         return report;
@@ -580,10 +873,14 @@ pub fn extract_hashes(text: &str) -> Vec<HashResult> {
 
 pub fn read_hash_list(path: impl AsRef<Path>) -> Result<Vec<HashResult>> {
     let path = path.as_ref();
-    let file = File::open(path).with_context(|| format!("could not open {}", path.display()))?;
+    let text =
+        fs::read_to_string(path).with_context(|| format!("could not open {}", path.display()))?;
+    if let Ok(entries) = parse_manifest(&text) {
+        return Ok(entries.into_iter().map(|entry| entry.hash).collect());
+    }
     let mut found = Vec::new();
-    for line in BufReader::new(file).lines() {
-        found.extend(extract_hashes(&line?));
+    for line in text.lines() {
+        found.extend(extract_hashes(line));
     }
     Ok(found)
 }
@@ -613,6 +910,7 @@ mod tests {
             got[3].value,
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+        assert_eq!(got[4].value, "352441c2");
     }
 
     #[test]
@@ -627,6 +925,54 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         assert_eq!(reports, vec![0, 1024 * 1024]);
+    }
+
+    #[test]
+    fn parses_standard_manifest_formats() {
+        let sha256 = "a".repeat(64);
+        let text = format!(
+            "{sha256}  folder/file.bin\nSHA256 (other.bin) = {sha256}\nlegacy.bin deadbeef\n"
+        );
+        let entries = parse_manifest(&text).unwrap();
+
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].path, PathBuf::from("folder/file.bin"));
+        assert_eq!(entries[0].hash.algorithm, Algorithm::Sha256);
+        assert_eq!(entries[1].path, PathBuf::from("other.bin"));
+        assert_eq!(entries[1].hash.algorithm, Algorithm::Sha256);
+        assert_eq!(entries[2].path, PathBuf::from("legacy.bin"));
+        assert_eq!(entries[2].hash.algorithm, Algorithm::Crc32);
+    }
+
+    #[test]
+    fn formats_gnu_bsd_and_sfv_manifests() {
+        let sha = ManifestEntry {
+            path: PathBuf::from("folder/file.bin"),
+            hash: HashResult {
+                algorithm: Algorithm::Sha256,
+                value: "a".repeat(64),
+            },
+        };
+        assert_eq!(
+            format_manifest(std::slice::from_ref(&sha), ManifestFormat::Gnu).unwrap(),
+            format!("{}  folder/file.bin\n", "a".repeat(64))
+        );
+        assert_eq!(
+            format_manifest(std::slice::from_ref(&sha), ManifestFormat::Bsd).unwrap(),
+            format!("SHA-256 (folder/file.bin) = {}\n", "a".repeat(64))
+        );
+
+        let sfv = ManifestEntry {
+            path: PathBuf::from("legacy.bin"),
+            hash: HashResult {
+                algorithm: Algorithm::Crc32,
+                value: "deadbeef".into(),
+            },
+        };
+        assert_eq!(
+            format_manifest(&[sfv], ManifestFormat::Sfv).unwrap(),
+            "legacy.bin deadbeef\n"
+        );
     }
 
     #[test]
@@ -684,6 +1030,10 @@ mod tests {
             Some(Algorithm::Md5)
         );
         assert_eq!(detect_expected_algorithm("not a hash"), None);
+        assert_eq!(
+            detect_expected_algorithm("CRC32: 352441c2"),
+            Some(Algorithm::Crc32)
+        );
     }
 
     #[test]

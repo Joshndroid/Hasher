@@ -6,8 +6,9 @@ use eframe::egui::{
     WidgetType,
 };
 use hasher::{
-    Algorithm, FileInspection, HashResult, VerifyOutcome, VerifyReport, build_report,
-    detect_expected_algorithm, format_results, hash_bytes, hash_ewf_media_with_progress,
+    Algorithm, FileInspection, HashResult, ManifestEntry, ManifestFormat, VerifyOutcome,
+    VerifyReport, build_report, collect_files_recursively, detect_expected_algorithm,
+    format_manifest, format_results, hash_bytes, hash_ewf_media_with_progress,
     hash_file_with_progress, inspect_file, is_ewf_path, normalise_expected_hash, read_hash_list,
 };
 use std::{
@@ -293,6 +294,9 @@ struct HasherApp {
     /// Per-file results when several files are hashed at once.
     batch: Vec<BatchEntry>,
     batch_pending: usize,
+    batch_root: Option<PathBuf>,
+    manifest_format: ManifestFormat,
+    manifest_algorithm: Algorithm,
     verify_expected: String,
     verify_input: VerifyInput,
     verify_text: String,
@@ -337,6 +341,9 @@ impl Default for HasherApp {
             file_hash_mode: FileHashMode::ContainerFile,
             batch: Vec::new(),
             batch_pending: 0,
+            batch_root: None,
+            manifest_format: ManifestFormat::Gnu,
+            manifest_algorithm: Algorithm::Sha256,
             verify_expected: String::new(),
             verify_input: VerifyInput::Text,
             verify_text: String::new(),
@@ -809,7 +816,27 @@ impl HasherApp {
     /// Route chosen or dropped paths: a single file uses the rich single-file
     /// view, several files are hashed as a batch.
     fn dispatch_paths(&mut self, mut paths: Vec<PathBuf>, ctx: egui::Context) {
+        if paths.len() == 1 && paths[0].is_dir() {
+            self.begin_folder_hash(paths.remove(0), ctx);
+            return;
+        }
+        let mut expanded = Vec::new();
+        for path in paths.drain(..) {
+            if path.is_dir() {
+                match collect_files_recursively(&path) {
+                    Ok(files) => expanded.extend(files),
+                    Err(error) => {
+                        self.status = format!("Could not read folder: {error:#}");
+                        return;
+                    }
+                }
+            } else {
+                expanded.push(path);
+            }
+        }
+        paths = expanded;
         if paths.is_empty() {
+            self.status = "No files found".into();
             return;
         }
         if paths.len() == 1 {
@@ -821,7 +848,21 @@ impl HasherApp {
             };
             self.begin_file_hash(path, mode, ctx);
         } else {
+            self.batch_root = None;
             self.begin_batch_hash(paths, ctx);
+        }
+    }
+
+    fn begin_folder_hash(&mut self, root: PathBuf, ctx: egui::Context) {
+        match collect_files_recursively(&root) {
+            Ok(paths) if paths.is_empty() => {
+                self.status = format!("No files found in {}", root.display());
+            }
+            Ok(paths) => {
+                self.batch_root = Some(root);
+                self.begin_batch_hash(paths, ctx);
+            }
+            Err(error) => self.status = format!("Could not read folder: {error:#}"),
         }
     }
 
@@ -829,6 +870,7 @@ impl HasherApp {
         self.batch.clear();
         self.batch_pending = 0;
         self.batch_receiver = None;
+        self.batch_root = None;
         self.file_path = path.display().to_string();
         self.file_is_ewf = is_ewf_path(&path);
         self.file_hash_mode = mode;
@@ -899,40 +941,41 @@ impl HasherApp {
         let (sender, receiver) = mpsc::channel();
         self.batch_receiver = Some(receiver);
         std::thread::spawn(move || {
-            for path in paths {
+            let work: Vec<_> = paths
+                .into_iter()
+                .map(|path| {
+                    let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                    (path, size)
+                })
+                .collect();
+            let total = work
+                .iter()
+                .fold(0_u64, |total, (_, size)| total.saturating_add(*size));
+            let mut completed = 0_u64;
+            for (path, size) in work {
                 if cancel.load(AtomicOrdering::Relaxed) {
                     let _ = sender.send(BatchMessage::Cancelled);
                     ctx.request_repaint();
                     return;
                 }
-                let ewf = is_ewf_path(&path);
-                let total = if ewf {
-                    inspect_file(&path)
-                        .ok()
-                        .and_then(|info| info.ewf.map(|details| details.media_size))
-                        .unwrap_or(0)
-                } else {
-                    fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
-                };
                 let progress_sender = sender.clone();
                 let progress_ctx = ctx.clone();
                 let mut report_progress = |processed| {
                     let keep_going = !cancel.load(AtomicOrdering::Relaxed);
-                    let _ = progress_sender.send(BatchMessage::Progress(processed, total));
+                    let _ = progress_sender.send(BatchMessage::Progress(
+                        completed.saturating_add(processed),
+                        total,
+                    ));
                     progress_ctx.request_repaint();
                     keep_going
                 };
-                let result = if ewf {
-                    hash_ewf_media_with_progress(&path, &mut report_progress)
-                        .map(|analysis| analysis.results)
-                } else {
-                    hash_file_with_progress(&path, &mut report_progress)
-                };
+                let result = hash_file_with_progress(&path, &mut report_progress);
                 if cancel.load(AtomicOrdering::Relaxed) {
                     let _ = sender.send(BatchMessage::Cancelled);
                     ctx.request_repaint();
                     return;
                 }
+                completed = completed.saturating_add(size);
                 let _ = sender.send(BatchMessage::Finished(path, Box::new(result)));
                 ctx.request_repaint();
             }
@@ -1127,31 +1170,58 @@ impl HasherApp {
     }
 
     fn export_batch(&mut self) {
+        let (file_name, filter_name, extensions) = match self.manifest_format {
+            ManifestFormat::Gnu => (
+                "SHA256SUMS",
+                "GNU checksum manifest",
+                &["txt", "sha256"][..],
+            ),
+            ManifestFormat::Bsd => (
+                "checksums.bsd",
+                "BSD checksum manifest",
+                &["bsd", "txt"][..],
+            ),
+            ManifestFormat::Sfv => ("checksums.sfv", "SFV manifest", &["sfv"][..]),
+        };
         let Some(path) = rfd::FileDialog::new()
-            .set_file_name("hashes.txt")
-            .add_filter("Text or log", &["txt", "log"])
+            .set_file_name(file_name)
+            .add_filter(filter_name, extensions)
             .save_file()
         else {
             return;
         };
-        let mut out = String::new();
+        let algorithm = if self.manifest_format == ManifestFormat::Sfv {
+            Algorithm::Crc32
+        } else {
+            self.manifest_algorithm
+        };
+        let mut entries = Vec::new();
         for entry in &self.batch {
-            match &entry.result {
-                Ok(hashes) => {
-                    out.push_str(&format!(
-                        "# {}\n{}\n\n",
-                        entry.path.display(),
-                        format_results(hashes)
-                    ));
-                }
-                Err(error) => {
-                    out.push_str(&format!(
-                        "# {}\n(error: {error:#})\n\n",
-                        entry.path.display()
-                    ));
-                }
-            }
+            let Ok(hashes) = &entry.result else {
+                continue;
+            };
+            let Some(hash) = hashes.iter().find(|hash| hash.algorithm == algorithm) else {
+                continue;
+            };
+            let manifest_path = self
+                .batch_root
+                .as_ref()
+                .and_then(|root| entry.path.strip_prefix(root).ok())
+                .map(PathBuf::from)
+                .or_else(|| entry.path.file_name().map(PathBuf::from))
+                .unwrap_or_else(|| entry.path.clone());
+            entries.push(ManifestEntry {
+                path: manifest_path,
+                hash: hash.clone(),
+            });
         }
+        let out = match format_manifest(&entries, self.manifest_format) {
+            Ok(out) => out,
+            Err(error) => {
+                self.status = format!("Export failed: {error:#}");
+                return;
+            }
+        };
         match fs::write(&path, out) {
             Ok(()) => self.status = format!("Exported {}", path.display()),
             Err(error) => self.status = format!("Export failed: {error}"),
@@ -1741,8 +1811,8 @@ impl HasherApp {
         section_header(
             pal,
             ui,
-            "Hash a file or forensic container",
-            "Choose one or more files, or drag and drop them anywhere on the window.",
+            "Hash files, folders, or forensic containers",
+            "Choose files or a folder, or drag and drop them anywhere on the window.",
         );
 
         card(pal, ui, |ui| {
@@ -1756,14 +1826,21 @@ impl HasherApp {
                     false,
                     egui::TextEdit::singleline(&mut shown)
                         .hint_text("No file selected")
-                        .desired_width(ui.available_width() - 110.0),
+                        .desired_width(ui.available_width() - 210.0),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui
                         .add_enabled(
                             !self.working && !self.verifying,
-                            egui::Button::new("Choose"),
+                            egui::Button::new("Folder"),
                         )
+                        .clicked()
+                        && let Some(path) = rfd::FileDialog::new().pick_folder()
+                    {
+                        self.begin_folder_hash(path, ctx.clone());
+                    }
+                    if ui
+                        .add_enabled(!self.working && !self.verifying, egui::Button::new("Files"))
                         .clicked()
                         && let Some(paths) = rfd::FileDialog::new().pick_files()
                     {
@@ -1846,6 +1923,41 @@ impl HasherApp {
                 }
             });
         });
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Manifest").color(pal.text_muted));
+            egui::ComboBox::from_id_salt("manifest-format")
+                .selected_text(match self.manifest_format {
+                    ManifestFormat::Gnu => "GNU / SHA256SUMS",
+                    ManifestFormat::Bsd => "BSD",
+                    ManifestFormat::Sfv => "SFV (CRC32)",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.manifest_format,
+                        ManifestFormat::Gnu,
+                        "GNU / SHA256SUMS",
+                    );
+                    ui.selectable_value(&mut self.manifest_format, ManifestFormat::Bsd, "BSD");
+                    ui.selectable_value(
+                        &mut self.manifest_format,
+                        ManifestFormat::Sfv,
+                        "SFV (CRC32)",
+                    );
+                });
+            if self.manifest_format != ManifestFormat::Sfv {
+                egui::ComboBox::from_id_salt("manifest-algorithm")
+                    .selected_text(self.manifest_algorithm.to_string())
+                    .show_ui(ui, |ui| {
+                        for algorithm in Algorithm::ALL {
+                            ui.selectable_value(
+                                &mut self.manifest_algorithm,
+                                algorithm,
+                                algorithm.to_string(),
+                            );
+                        }
+                    });
+            }
+        });
         ui.add_space(6.0);
 
         // Take the batch out so the per-row closures can still touch `self`.
@@ -1927,7 +2039,11 @@ impl HasherApp {
                     {
                         match read_hash_list(&path) {
                             Ok(values) if !values.is_empty() => {
-                                self.verify_expected = values[0].value.clone();
+                                self.verify_expected = if values[0].algorithm == Algorithm::Crc32 {
+                                    format!("CRC32: {}", values[0].value)
+                                } else {
+                                    values[0].value.clone()
+                                };
                                 self.status = if values.len() > 1 {
                                     format!("Imported the first of {} hash values", values.len())
                                 } else {
@@ -1954,7 +2070,7 @@ impl HasherApp {
                     if algorithm == Algorithm::Adler32 {
                         ui.label(
                             RichText::new(
-                                "8-hex values are ambiguous — confirm this is an ADLER32 checksum.",
+                                "Unlabelled 8-hex values are treated as ADLER32; prefix CRC32 values with \"CRC32:\".",
                             )
                             .size(11.0)
                             .color(pal.text_muted),
@@ -2247,7 +2363,7 @@ impl HasherApp {
             );
             ui.add_space(1.0);
             ui.label(
-                RichText::new("Algorithms: ADLER32 · MD5 · SHA-1 · SHA-256")
+                RichText::new("Algorithms: ADLER32 · CRC32 · MD5 · SHA-1 · SHA-256")
                     .size(12.0)
                     .color(pal.text_muted),
             );
@@ -2280,6 +2396,7 @@ impl HasherApp {
                 ui.add_space(6.0);
                 for (name, detail) in [
                     ("ADLER32", "8 hex characters"),
+                    ("CRC32", "8 hex characters (standard SFV)"),
                     ("MD5", "32 hex characters"),
                     ("SHA-1", "40 hex characters"),
                     ("SHA-256", "64 hex characters"),

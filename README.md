@@ -10,9 +10,10 @@ connection after installation.
 
 ## Features
 
-- ADLER32, MD5, SHA-1, and SHA-256 in a single pass
+- ADLER32, CRC32, MD5, SHA-1, and SHA-256 in a single pass
 - Exact UTF-8 text and number-string hashing
-- Buffered, background file hashing with single- or multi-file drag and drop
+- Buffered, cancellable background hashing with recursive folder support
+- GNU/coreutils, BSD checksum, `SHA256SUMS`, and SFV-style manifests
 - Theme, accent, and hash-row order remembered between runs
 - `.txt` and `.log` hash-value import and export
 - `.dd`, `.img`, `.raw`, numbered raw segments (`.001`, etc.), and EWF
@@ -32,6 +33,8 @@ cargo run --bin hasher
 cargo run --bin hasher-cli -- text "123456"
 cargo run --bin hasher-cli -- file evidence.img --algorithm sha256
 cargo run --bin hasher-cli -- file evidence.img --output evidence.log
+cargo run --bin hasher-cli -- folder evidence --algorithm sha256 --format gnu --output SHA256SUMS
+cargo run --bin hasher-cli -- --check SHA256SUMS
 cargo run --bin hasher-cli -- ewf evidence.E01 --algorithm sha256
 cargo run --bin hasher-cli -- read acquisition.log
 cargo run --bin hasher-cli -- inspect evidence.E01
@@ -43,6 +46,12 @@ cargo run --bin hasher-cli -- verify <expected-hash> --file evidence.E01
 against the file or text, and exits `0` on a match, `1` on a mismatch, and `2`
 when the expected value or input cannot be used (handy in scripts and CI).
 
+`folder` walks regular files recursively without following directory symlinks.
+Manifest formats are `gnu`, `bsd`, and `sfv`; standard SFV output uses CRC32
+and therefore requires `--algorithm crc32`. `--check`
+auto-detects all supported manifest line formats, resolves relative entries from
+the manifest's directory (or `--base`), and exits `1` if any entry fails.
+
 For laggy virtual machines, the GUI now uses native OS window chrome by default
 because it is much cheaper to move and resize than the custom frameless window.
 Set `HASHER_CUSTOM_CHROME=1` to restore the old custom title bar. If the virtual
@@ -50,8 +59,8 @@ GPU is still unhappy, try `HASHER_RENDERER=glow cargo run --bin hasher` or
 `HASHER_RENDERER=wgpu cargo run --bin hasher`; `HASHER_SOFTWARE_RENDERER=1` is
 also available for the OpenGL backend on platforms that support it.
 
-Algorithm names accepted by `--algorithm` are `all`, `adler32`, `md5`, `sha1`,
-and `sha256`. CLI output is written to stdout and errors to stderr.
+Algorithm names accepted by `--algorithm` are `all`, `adler32`, `crc32`, `md5`,
+`sha1`, and `sha256`. CLI output is written to stdout and errors to stderr.
 
 ## Build and package
 
@@ -94,8 +103,8 @@ is a segmented, compressed Expert Witness container. Hasher keeps these concepts
 - **Acquisition digest:** a value stored by the acquisition tool inside the EWF
   hash/digest section. Hasher extracts stored MD5 and SHA-1 values when present.
 - **Evidence-stream hash:** hashes the decompressed/reconstructed media across the
-  complete discovered EWF segment set. Hasher computes ADLER32, MD5, SHA-1 and
-  SHA-256 over that logical stream in one pass.
+  complete discovered EWF segment set. Hasher computes ADLER32, CRC32, MD5,
+  SHA-1 and SHA-256 over that logical stream in one pass.
 
 EWF files default to evidence-stream mode. The GUI shows stored acquisition digests,
 MATCH/MISMATCH results, logical media geometry, populated case fields and recorded

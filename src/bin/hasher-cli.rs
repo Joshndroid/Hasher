@@ -1,10 +1,15 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use hasher::{
-    Algorithm, VerifyOutcome, build_report, format_results, hash_bytes, hash_ewf_media, hash_file,
-    inspect_file, is_ewf_path, read_hash_list,
+    Algorithm, ManifestEntry, ManifestFormat, VerifyOutcome, build_report,
+    collect_files_recursively, format_manifest, format_results, hash_bytes, hash_ewf_media,
+    hash_file, inspect_file, is_ewf_path, read_hash_list, read_manifest,
 };
-use std::{fs, path::PathBuf, process::ExitCode};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::ExitCode,
+};
 
 #[derive(Parser)]
 #[command(
@@ -13,8 +18,14 @@ use std::{fs, path::PathBuf, process::ExitCode};
     about = "Hash text, files, and forensic image containers"
 )]
 struct Cli {
+    /// Verify every entry in a GNU, BSD, SHA256SUMS, or SFV manifest.
+    #[arg(short = 'c', long, value_name = "MANIFEST")]
+    check: Option<PathBuf>,
+    /// Resolve relative --check entries from this directory instead of the manifest directory.
+    #[arg(long, requires = "check")]
+    base: Option<PathBuf>,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -41,6 +52,16 @@ enum Command {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+    /// Recursively hash every regular file below a folder.
+    Folder {
+        path: PathBuf,
+        #[arg(short, long, default_value = "sha256")]
+        algorithm: String,
+        #[arg(short, long, default_value = "gnu")]
+        format: String,
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
     /// Extract supported hash values from a .txt or .log file.
     Read { path: PathBuf },
     /// Identify a forensic image/container and discover sidecar hashes.
@@ -48,7 +69,7 @@ enum Command {
     /// Compare an expected hash against a file or text. Exits 1 on mismatch,
     /// 2 when the expected value or input is unusable.
     Verify {
-        /// The trusted hash to check against (ADLER32, MD5, SHA-1 or SHA-256).
+        /// The trusted hash to check against (ADLER32, CRC32, MD5, SHA-1 or SHA-256).
         expected: String,
         /// Hash this file (raw or EWF/E01) and compare.
         #[arg(short, long, conflicts_with = "text")]
@@ -123,9 +144,104 @@ fn run_verify(expected: &str, file: Option<PathBuf>, text: Option<String>) -> Re
     }
 }
 
+fn manifest_path(root: &Path, path: &Path) -> PathBuf {
+    path.strip_prefix(root)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn run_folder(
+    root: PathBuf,
+    algorithm: &str,
+    format: &str,
+    output: Option<PathBuf>,
+) -> Result<ExitCode> {
+    let algorithm = Algorithm::parse(algorithm)?;
+    let format = ManifestFormat::parse(format)?;
+    if format == ManifestFormat::Sfv && algorithm != Algorithm::Crc32 {
+        bail!("SFV output requires --algorithm crc32");
+    }
+
+    let output_canonical = output.as_ref().and_then(|path| fs::canonicalize(path).ok());
+    let paths = collect_files_recursively(&root)?;
+    if paths.is_empty() {
+        bail!("no files found in {}", root.display());
+    }
+    let mut entries = Vec::with_capacity(paths.len());
+    for path in paths {
+        if output_canonical
+            .as_ref()
+            .is_some_and(|output| fs::canonicalize(&path).is_ok_and(|file| file == *output))
+        {
+            continue;
+        }
+        let results = hash_file(&path)?;
+        let hash = results
+            .into_iter()
+            .find(|result| result.algorithm == algorithm)
+            .context("selected algorithm was not computed")?;
+        entries.push(ManifestEntry {
+            path: manifest_path(&root, &path),
+            hash,
+        });
+    }
+    let rendered = format_manifest(&entries, format)?;
+    if let Some(output) = output {
+        fs::write(&output, rendered)
+            .with_context(|| format!("could not write {}", output.display()))?;
+    } else {
+        print!("{rendered}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_check(manifest: PathBuf, base: Option<PathBuf>) -> Result<ExitCode> {
+    let entries = read_manifest(&manifest)?;
+    let base = base.unwrap_or_else(|| {
+        manifest
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf()
+    });
+    let mut failed = 0_usize;
+    for entry in entries {
+        let path = if entry.path.is_absolute() {
+            entry.path.clone()
+        } else {
+            base.join(&entry.path)
+        };
+        let result = hash_file(&path)
+            .ok()
+            .and_then(|hashes| {
+                hashes
+                    .into_iter()
+                    .find(|hash| hash.algorithm == entry.hash.algorithm)
+            })
+            .is_some_and(|computed| computed.value == entry.hash.value);
+        if result {
+            println!("{}: OK", entry.path.display());
+        } else {
+            println!("{}: FAILED", entry.path.display());
+            failed += 1;
+        }
+    }
+    Ok(if failed == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    })
+}
+
 fn main() -> Result<ExitCode> {
     let cli = Cli::parse();
-    let code = match cli.command {
+    if let Some(manifest) = cli.check {
+        if cli.command.is_some() {
+            bail!("--check cannot be combined with a subcommand");
+        }
+        return run_check(manifest, cli.base);
+    }
+    let command = cli.command.context("a subcommand or --check is required")?;
+    let code = match command {
         Command::Text { value, algorithm } => {
             println!(
                 "{}",
@@ -168,6 +284,12 @@ fn main() -> Result<ExitCode> {
             emit(&rendered, output)?;
             ExitCode::SUCCESS
         }
+        Command::Folder {
+            path,
+            algorithm,
+            format,
+            output,
+        } => run_folder(path, &algorithm, &format, output)?,
         Command::Read { path } => {
             println!("{}", format_results(&read_hash_list(path)?));
             ExitCode::SUCCESS
