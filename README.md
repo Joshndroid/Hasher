@@ -13,7 +13,7 @@ connection after installation.
 - ADLER32, CRC32, MD5, SHA-1, and SHA-256 in a single pass
 - Exact UTF-8 text and number-string hashing
 - Buffered, cancellable background hashing with recursive folder support
-- GNU/coreutils, BSD checksum, `SHA256SUMS`, and SFV-style manifests
+- GNU/coreutils, BSD checksum, `SHA256SUMS`, and SFV-style manifest creation and verification
 - Theme, accent, and hash-row order remembered between runs
 - `.txt` and `.log` hash-value import and export
 - `.dd`, `.img`, `.raw`, numbered raw segments (`.001`, etc.), and EWF
@@ -21,6 +21,8 @@ connection after installation.
 - Pure-Rust EWF reconstruction across complete multi-segment sets
 - Embedded EWF MD5/SHA-1 acquisition-digest and case-metadata extraction
 - Explicit MATCH/MISMATCH comparison of stored and reconstructed-media hashes
+- Drag-and-drop manifest verification with per-file match, mismatch, and error results
+- Actionable recent jobs for quickly repeating hashes and verification checks
 - Acquisition read-error reporting and optional compressed container-segment hashing
 - System, dark, and light themes with an editable accent colour
 - JetBrains Mono embedded in the executable

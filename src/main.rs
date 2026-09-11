@@ -10,12 +10,12 @@ use hasher::{
     VerifyReport, build_report, collect_files_recursively, detect_expected_algorithm,
     format_manifest, format_results, hash_bytes, hash_ewf_media_with_progress,
     hash_file_with_progress, hash_raw_media_with_progress, inspect_file, is_ewf_path,
-    is_raw_segment_path, normalise_expected_hash, raw_segment_paths, read_hash_list,
+    is_raw_segment_path, normalise_expected_hash, raw_segment_paths, read_hash_list, read_manifest,
 };
 use std::{
     cmp::Ordering,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering as AtomicOrdering},
@@ -48,7 +48,12 @@ struct PersistedSettings {
     theme: ThemeChoice,
     accent: [u8; 4],
     order: Vec<Algorithm>,
-    reorder_locked: bool,
+    #[serde(default = "default_primary_algorithm")]
+    primary_algorithm: Algorithm,
+}
+
+fn default_primary_algorithm() -> Algorithm {
+    Algorithm::Sha256
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -70,6 +75,7 @@ enum WorkResult {
         Box<anyhow::Result<(Vec<HashResult>, FileInspection)>>,
     ),
     Verified(anyhow::Result<Vec<HashResult>>),
+    ManifestChecked(PathBuf, anyhow::Result<Vec<ManifestCheckEntry>>),
 }
 
 enum FileMessage {
@@ -107,6 +113,55 @@ struct GitHubRelease {
 enum VerifyInput {
     Text,
     File,
+    Manifest,
+}
+
+#[derive(Clone)]
+struct ManifestCheckEntry {
+    path: PathBuf,
+    expected: HashResult,
+    computed: Option<String>,
+    error: Option<String>,
+}
+
+impl ManifestCheckEntry {
+    fn matches(&self) -> bool {
+        self.computed.as_deref() == Some(self.expected.value.as_str())
+    }
+}
+
+#[derive(Clone)]
+enum RecentAction {
+    HashFile(PathBuf, FileHashMode),
+    HashFiles(Vec<PathBuf>),
+    HashFolder(PathBuf),
+    VerifyText { expected: String, text: String },
+    VerifyFile { expected: String, path: PathBuf },
+    VerifyManifest(PathBuf),
+}
+
+#[derive(Clone)]
+struct RecentJob {
+    label: String,
+    detail: String,
+    action: RecentAction,
+    successful: bool,
+}
+
+fn looks_like_manifest(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(extension.as_str(), "sfv" | "sha1" | "sha256" | "md5")
+        || name.contains("checksums")
+        || name.ends_with("sums")
 }
 
 fn verify_status_line(report: &VerifyReport) -> String {
@@ -198,12 +253,12 @@ struct Palette {
 fn palette(dark: bool, accent: Color32) -> Palette {
     if dark {
         Palette {
-            base: Color32::from_rgb(13, 17, 23),
-            surface: Color32::from_rgb(22, 27, 34),
-            surface_alt: Color32::from_rgb(30, 36, 44),
-            border: Color32::from_rgb(48, 54, 61),
-            text: Color32::from_rgb(230, 237, 243),
-            text_muted: Color32::from_rgb(139, 148, 158),
+            base: Color32::from_rgb(7, 11, 22),
+            surface: Color32::from_rgb(12, 19, 34),
+            surface_alt: Color32::from_rgb(18, 28, 48),
+            border: Color32::from_rgb(38, 53, 78),
+            text: Color32::from_rgb(238, 244, 255),
+            text_muted: Color32::from_rgb(135, 151, 178),
             accent,
             danger: Color32::from_rgb(248, 81, 73),
             success: Color32::from_rgb(63, 185, 80),
@@ -295,6 +350,7 @@ struct HasherApp {
     batch: Vec<BatchEntry>,
     batch_pending: usize,
     batch_root: Option<PathBuf>,
+    batch_inputs: Vec<PathBuf>,
     manifest_format: ManifestFormat,
     manifest_algorithm: Algorithm,
     verify_expected: String,
@@ -302,6 +358,8 @@ struct HasherApp {
     verify_text: String,
     verify_file: String,
     verify_report: Option<VerifyReport>,
+    verify_manifest: String,
+    manifest_results: Vec<ManifestCheckEntry>,
     verifying: bool,
     status: String,
     working: bool,
@@ -313,11 +371,13 @@ struct HasherApp {
     update_state: UpdateState,
     update_receiver: Option<Receiver<anyhow::Result<UpdateInfo>>>,
     icon_texture: Option<egui::TextureHandle>,
+    recent_jobs: Vec<RecentJob>,
+    secondary_hashes_open: bool,
     supported_formats_open: bool,
     /// User-chosen display order for the hash rows, keyed by algorithm so it
     /// survives re-hashing when the text or file changes.
     order: Vec<Algorithm>,
-    reorder_locked: bool,
+    primary_algorithm: Algorithm,
     /// Cache of the last appearance we applied, so we only rebuild the egui
     /// style when the theme or accent actually changes (cheap frames in a VM).
     style_key: Option<(bool, [u8; 4])>,
@@ -342,6 +402,7 @@ impl Default for HasherApp {
             batch: Vec::new(),
             batch_pending: 0,
             batch_root: None,
+            batch_inputs: Vec::new(),
             manifest_format: ManifestFormat::Gnu,
             manifest_algorithm: Algorithm::Sha256,
             verify_expected: String::new(),
@@ -349,6 +410,8 @@ impl Default for HasherApp {
             verify_text: String::new(),
             verify_file: String::new(),
             verify_report: None,
+            verify_manifest: String::new(),
+            manifest_results: Vec::new(),
             verifying: false,
             status: "Ready".into(),
             working: false,
@@ -360,9 +423,11 @@ impl Default for HasherApp {
             update_state: UpdateState::Idle,
             update_receiver: None,
             icon_texture: None,
+            recent_jobs: Vec::new(),
+            secondary_hashes_open: false,
             supported_formats_open: false,
             order: Algorithm::ALL.to_vec(),
-            reorder_locked: false,
+            primary_algorithm: Algorithm::Sha256,
             style_key: None,
         }
     }
@@ -378,10 +443,70 @@ fn card<R>(pal: Palette, ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R
     Frame::new()
         .fill(pal.surface)
         .stroke(Stroke::new(1.0, pal.border))
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin::same(12))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::same(14))
         .show(ui, add)
         .inner
+}
+
+const SIGNAL_VIOLET: Color32 = Color32::from_rgb(196, 84, 255);
+
+fn signal_card<R>(pal: Palette, ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    Frame::new()
+        .fill(pal.surface)
+        .stroke(Stroke::new(1.5, pal.accent))
+        .corner_radius(CornerRadius::same(12))
+        .inner_margin(Margin::same(16))
+        .shadow(Shadow {
+            offset: [0, 4],
+            blur: 18,
+            spread: 0,
+            color: pal.accent.gamma_multiply(0.12),
+        })
+        .show(ui, add)
+        .inner
+}
+
+fn signal_backdrop(pal: Palette, ui: &egui::Ui) {
+    let rect = ui.max_rect();
+    let painter = ui.painter();
+    let stroke = Stroke::new(1.0, pal.border.gamma_multiply(0.30));
+    let cyan = pal.accent.gamma_multiply(0.18);
+    let violet = SIGNAL_VIOLET.gamma_multiply(0.15);
+    for offset in [0.0, 18.0, 36.0] {
+        let y = rect.top() + 122.0 + offset;
+        painter.line_segment(
+            [
+                egui::pos2(rect.left(), y),
+                egui::pos2(rect.left() + 76.0, y),
+            ],
+            stroke,
+        );
+        painter.line_segment(
+            [
+                egui::pos2(rect.left() + 76.0, y),
+                egui::pos2(rect.left() + 94.0, y + 12.0),
+            ],
+            Stroke::new(1.0, cyan),
+        );
+        painter.circle_filled(egui::pos2(rect.left() + 97.0, y + 14.0), 2.0, cyan);
+
+        painter.line_segment(
+            [
+                egui::pos2(rect.right() - 76.0, y),
+                egui::pos2(rect.right(), y),
+            ],
+            stroke,
+        );
+        painter.line_segment(
+            [
+                egui::pos2(rect.right() - 94.0, y + 12.0),
+                egui::pos2(rect.right() - 76.0, y),
+            ],
+            Stroke::new(1.0, violet),
+        );
+        painter.circle_filled(egui::pos2(rect.right() - 97.0, y + 14.0), 2.0, violet);
+    }
 }
 
 /// A small rounded label, e.g. an algorithm name.
@@ -402,47 +527,16 @@ fn section_header(pal: Palette, ui: &mut egui::Ui, title: &str, subtitle: &str) 
     ui.add_space(8.0);
 }
 
-/// A full-width, left-aligned sidebar navigation entry with a selected pill.
-/// Returns true when clicked.
-fn nav_button(pal: Palette, ui: &mut egui::Ui, selected: bool, label: &str) -> bool {
-    let desired = Vec2::new(ui.available_width(), 32.0);
-    let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click());
-    let radius = CornerRadius::same(7);
-    let painter = ui.painter().clone();
-
-    let bg = if selected {
-        pal.accent.gamma_multiply(0.20)
-    } else if response.hovered() {
-        pal.surface_alt
-    } else {
-        Color32::TRANSPARENT
-    };
-    painter.rect_filled(rect, radius, bg);
+fn mode_button(pal: Palette, ui: &mut egui::Ui, selected: bool, label: &str) -> bool {
+    let text = if selected { pal.text } else { pal.text_muted };
+    let mut button = egui::Button::new(RichText::new(label).size(12.0).strong().color(text))
+        .min_size(Vec2::new(82.0, 30.0));
     if selected {
-        painter.rect_stroke(
-            rect,
-            radius,
-            Stroke::new(1.0, pal.accent.gamma_multiply(0.85)),
-            egui::StrokeKind::Inside,
-        );
+        button = button
+            .fill(pal.accent.gamma_multiply(0.24))
+            .stroke(Stroke::new(1.0, SIGNAL_VIOLET));
     }
-
-    let text_color = if selected { pal.text } else { pal.text_muted };
-    painter.text(
-        egui::pos2(rect.left() + 12.0, rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        label,
-        FontId::new(13.0, FontFamily::Proportional),
-        text_color,
-    );
-
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    response
-        .widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, true, selected, label));
-    ui.add_space(2.0);
-    response.clicked()
+    ui.add(button).clicked()
 }
 
 /// Draw invisible drag zones around the window edges and corners. Because the
@@ -583,27 +677,6 @@ fn accent_swatch(ui: &mut egui::Ui, color: Color32, selected: bool) -> bool {
     response
         .widget_info(|| WidgetInfo::selected(WidgetType::Button, true, selected, "Accent colour"));
     response.clicked()
-}
-
-fn grip_handle(pal: Palette, ui: &mut egui::Ui) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(16.0, 22.0), egui::Sense::hover());
-    let color = if response.hovered() {
-        pal.accent
-    } else {
-        pal.text_muted
-    };
-    let painter = ui.painter();
-    for row in 0..3 {
-        for col in 0..2 {
-            let pos = egui::pos2(
-                rect.center().x - 3.0 + col as f32 * 6.0,
-                rect.center().y - 6.0 + row as f32 * 6.0,
-            );
-            painter.circle_filled(pos, 1.4, color);
-        }
-    }
-    response.widget_info(|| WidgetInfo::labeled(WidgetType::Other, true, "Drag to reorder hash"));
-    response.on_hover_text("Drag to reorder")
 }
 
 impl HasherApp {
@@ -853,6 +926,52 @@ impl HasherApp {
         }
     }
 
+    fn record_recent(&mut self, job: RecentJob) {
+        self.recent_jobs
+            .retain(|existing| existing.label != job.label || existing.detail != job.detail);
+        self.recent_jobs.insert(0, job);
+        self.recent_jobs.truncate(4);
+    }
+
+    fn replay_recent(&mut self, action: RecentAction, ctx: egui::Context) {
+        if self.working || self.verifying {
+            return;
+        }
+        match action {
+            RecentAction::HashFile(path, mode) => {
+                self.page = Page::File;
+                self.begin_file_hash(path, mode, ctx);
+            }
+            RecentAction::HashFiles(paths) => {
+                self.page = Page::File;
+                self.batch_root = None;
+                self.begin_batch_hash(paths, ctx);
+            }
+            RecentAction::HashFolder(path) => {
+                self.page = Page::File;
+                self.begin_folder_hash(path, ctx);
+            }
+            RecentAction::VerifyText { expected, text } => {
+                self.page = Page::Verify;
+                self.verify_input = VerifyInput::Text;
+                self.verify_expected = expected;
+                self.verify_text = text;
+                self.run_text_verify();
+            }
+            RecentAction::VerifyFile { expected, path } => {
+                self.page = Page::Verify;
+                self.verify_input = VerifyInput::File;
+                self.verify_expected = expected;
+                self.begin_verify_file(path, ctx);
+            }
+            RecentAction::VerifyManifest(path) => {
+                self.page = Page::Verify;
+                self.verify_input = VerifyInput::Manifest;
+                self.begin_manifest_verify(path, ctx);
+            }
+        }
+    }
+
     fn begin_folder_hash(&mut self, root: PathBuf, ctx: egui::Context) {
         match collect_files_recursively(&root) {
             Ok(paths) if paths.is_empty() => {
@@ -943,6 +1062,7 @@ impl HasherApp {
         self.results_source = None;
         self.inspection = None;
         self.batch.clear();
+        self.batch_inputs = paths.clone();
         self.batch_pending = paths.len();
         self.working = true;
         self.progress = Some((0, 0));
@@ -995,6 +1115,7 @@ impl HasherApp {
 
     fn begin_verify_file(&mut self, path: PathBuf, ctx: egui::Context) {
         self.verify_file = path.display().to_string();
+        self.manifest_results.clear();
         self.verifying = true;
         self.progress = Some((0, 0));
         let cancel = Arc::new(AtomicBool::new(false));
@@ -1044,11 +1165,104 @@ impl HasherApp {
         });
     }
 
+    fn begin_manifest_verify(&mut self, path: PathBuf, ctx: egui::Context) {
+        self.verify_manifest = path.display().to_string();
+        self.verify_report = None;
+        self.manifest_results.clear();
+        self.verifying = true;
+        self.progress = Some((0, 0));
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancel = Some(cancel.clone());
+        self.status = format!("Checking manifest {}…", path.display());
+        let (sender, receiver) = mpsc::channel();
+        self.verify_receiver = Some(receiver);
+        std::thread::spawn(move || {
+            let result = read_manifest(&path).and_then(|entries| {
+                let base = path.parent().unwrap_or_else(|| Path::new("."));
+                let work: Vec<_> = entries
+                    .into_iter()
+                    .map(|entry| {
+                        let resolved = if entry.path.is_absolute() {
+                            entry.path.clone()
+                        } else {
+                            base.join(&entry.path)
+                        };
+                        let size = fs::metadata(&resolved)
+                            .map(|metadata| metadata.len())
+                            .unwrap_or(0);
+                        (entry, resolved, size)
+                    })
+                    .collect();
+                let total = work
+                    .iter()
+                    .fold(0_u64, |sum, (_, _, size)| sum.saturating_add(*size));
+                let mut completed = 0_u64;
+                let mut checked = Vec::with_capacity(work.len());
+
+                for (entry, resolved, size) in work {
+                    if cancel.load(AtomicOrdering::Relaxed) {
+                        break;
+                    }
+                    let progress_sender = sender.clone();
+                    let progress_ctx = ctx.clone();
+                    let mut report_progress = |processed| {
+                        let keep_going = !cancel.load(AtomicOrdering::Relaxed);
+                        let _ = progress_sender.send(VerifyMessage::Progress(
+                            completed.saturating_add(processed),
+                            total,
+                        ));
+                        progress_ctx.request_repaint();
+                        keep_going
+                    };
+                    let computed = hash_file_with_progress(&resolved, &mut report_progress);
+                    let checked_entry = match computed {
+                        Ok(hashes) => ManifestCheckEntry {
+                            path: entry.path,
+                            computed: hashes
+                                .iter()
+                                .find(|hash| hash.algorithm == entry.hash.algorithm)
+                                .map(|hash| hash.value.clone()),
+                            expected: entry.hash,
+                            error: None,
+                        },
+                        Err(error) => ManifestCheckEntry {
+                            path: entry.path,
+                            expected: entry.hash,
+                            computed: None,
+                            error: Some(format!("{error:#}")),
+                        },
+                    };
+                    checked.push(checked_entry);
+                    completed = completed.saturating_add(size);
+                }
+                Ok(checked)
+            });
+            let _ = sender.send(VerifyMessage::Finished(WorkResult::ManifestChecked(
+                path, result,
+            )));
+            ctx.request_repaint();
+        });
+    }
+
     fn run_text_verify(&mut self) {
+        self.manifest_results.clear();
         let results = hash_bytes(self.verify_text.as_bytes());
         let report = build_report(&self.verify_expected, &results);
         self.status = verify_status_line(&report);
-        self.verify_report = Some(report);
+        self.verify_report = Some(report.clone());
+        self.record_recent(RecentJob {
+            label: "Verified text".into(),
+            detail: format!(
+                "{} bytes · {}",
+                self.verify_text.len(),
+                verify_status_line(&report)
+            ),
+            action: RecentAction::VerifyText {
+                expected: self.verify_expected.clone(),
+                text: self.verify_text.clone(),
+            },
+            successful: report.outcome == VerifyOutcome::Match,
+        });
     }
 
     fn poll_work(&mut self) {
@@ -1084,6 +1298,18 @@ impl HasherApp {
                     self.results = hashes;
                     self.results_source = Some(ResultSource::File);
                     self.inspection = Some(info);
+                    self.record_recent(RecentJob {
+                        label: format!(
+                            "Hashed {}",
+                            path.file_name().unwrap_or_default().to_string_lossy()
+                        ),
+                        detail: match mode {
+                            FileHashMode::EvidenceStream => "Evidence stream".into(),
+                            FileHashMode::ContainerFile => "Selected file".into(),
+                        },
+                        action: RecentAction::HashFile(path.clone(), mode),
+                        successful: true,
+                    });
                     self.status = match mode {
                         FileHashMode::EvidenceStream => {
                             format!(
@@ -1119,7 +1345,7 @@ impl HasherApp {
                 VerifyMessage::Finished(result) => verify_finished = Some(result),
             }
         }
-        if let Some(WorkResult::Verified(result)) = verify_finished {
+        if let Some(finished) = verify_finished {
             let cancelled = self
                 .cancel
                 .as_ref()
@@ -1132,13 +1358,52 @@ impl HasherApp {
                 self.status = "Verification cancelled".into();
                 return;
             }
-            match result {
-                Ok(hashes) => {
+            match finished {
+                WorkResult::Verified(Ok(hashes)) => {
                     let report = build_report(&self.verify_expected, &hashes);
                     self.status = verify_status_line(&report);
-                    self.verify_report = Some(report);
+                    self.verify_report = Some(report.clone());
+                    let path = PathBuf::from(&self.verify_file);
+                    self.record_recent(RecentJob {
+                        label: format!(
+                            "Verified {}",
+                            path.file_name().unwrap_or_default().to_string_lossy()
+                        ),
+                        detail: verify_status_line(&report),
+                        action: RecentAction::VerifyFile {
+                            expected: self.verify_expected.clone(),
+                            path,
+                        },
+                        successful: report.outcome == VerifyOutcome::Match,
+                    });
                 }
-                Err(error) => self.status = format!("Verify failed: {error:#}"),
+                WorkResult::Verified(Err(error)) => {
+                    self.status = format!("Verify failed: {error:#}")
+                }
+                WorkResult::ManifestChecked(path, Ok(entries)) => {
+                    let matches = entries.iter().filter(|entry| entry.matches()).count();
+                    let errors = entries.iter().filter(|entry| entry.error.is_some()).count();
+                    let mismatches = entries.len().saturating_sub(matches + errors);
+                    self.status = format!(
+                        "Manifest checked · {matches} matched · {mismatches} mismatched · {errors} errors"
+                    );
+                    self.record_recent(RecentJob {
+                        label: format!(
+                            "Checked {}",
+                            path.file_name().unwrap_or_default().to_string_lossy()
+                        ),
+                        detail: format!(
+                            "{matches} matched · {mismatches} mismatched · {errors} errors"
+                        ),
+                        action: RecentAction::VerifyManifest(path),
+                        successful: mismatches == 0 && errors == 0,
+                    });
+                    self.manifest_results = entries;
+                }
+                WorkResult::ManifestChecked(_, Err(error)) => {
+                    self.status = format!("Manifest check failed: {error:#}")
+                }
+                WorkResult::Hashed(_, _, _) => {}
             }
         }
 
@@ -1189,6 +1454,29 @@ impl HasherApp {
             } else {
                 format!("Hashed {} files · {failed} failed", self.batch.len())
             };
+            let action = if let Some(root) = &self.batch_root {
+                RecentAction::HashFolder(root.clone())
+            } else {
+                RecentAction::HashFiles(self.batch_inputs.clone())
+            };
+            let label = if let Some(root) = &self.batch_root {
+                format!(
+                    "Hashed folder {}",
+                    root.file_name().unwrap_or_default().to_string_lossy()
+                )
+            } else {
+                format!("Hashed {} files", self.batch.len())
+            };
+            self.record_recent(RecentJob {
+                label,
+                detail: if failed == 0 {
+                    "All files completed".into()
+                } else {
+                    format!("{failed} failed")
+                },
+                action,
+                successful: failed == 0,
+            });
         }
     }
 
@@ -1346,98 +1634,99 @@ impl HasherApp {
             return;
         }
 
-        let mut drag_from: Option<usize> = None;
-        let mut drop_to: Option<usize> = None;
+        let primary = ordered
+            .iter()
+            .find(|result| result.algorithm == self.primary_algorithm)
+            .unwrap_or(&ordered[0])
+            .clone();
+        let secondary: Vec<HashResult> = ordered
+            .iter()
+            .filter(|result| result.algorithm != primary.algorithm)
+            .cloned()
+            .collect();
 
-        for (idx, result) in ordered.iter().enumerate() {
-            let algorithm = result.algorithm.to_string();
-            let value = result.value.clone();
-            let row_id = egui::Id::new(("hash-row", algorithm.as_str()));
+        signal_card(pal, ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(primary.algorithm.to_string())
+                        .size(14.0)
+                        .strong()
+                        .color(pal.text),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.small_button("Copy").clicked() {
+                        ui.ctx().copy_text(primary.value.clone());
+                        self.status = format!("Copied {}", primary.algorithm);
+                    }
+                });
+            });
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                let estimated_width =
+                    (primary.value.chars().count() as f32 * 8.5).min(ui.available_width());
+                ui.add_space(((ui.available_width() - estimated_width) * 0.5).max(0.0));
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(&primary.value)
+                            .monospace()
+                            .size(15.0)
+                            .color(pal.text),
+                    )
+                    .selectable(true)
+                    .wrap(),
+                );
+            });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.add_space(((ui.available_width() - 76.0) * 0.5).max(0.0));
+                chip(pal, ui, "COMPUTED", pal.success);
+            });
 
-            let mut draw_row = |ui: &mut egui::Ui, show_handle: bool| {
-                card(pal, ui, |ui| {
-                    ui.horizontal(|ui| {
-                        if show_handle {
-                            grip_handle(pal, ui);
+            if !secondary.is_empty() {
+                ui.add_space(10.0);
+                ui.separator();
+                if self.secondary_hashes_open {
+                    for result in &secondary {
+                        ui.add_space(5.0);
+                        ui.horizontal(|ui| {
+                            chip(pal, ui, &result.algorithm.to_string(), pal.text_muted);
                             ui.add_space(6.0);
-                        }
-                        chip(pal, ui, &algorithm, pal.accent);
-                        ui.add_space(6.0);
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.small_button("Copy").clicked() {
-                                ui.ctx().copy_text(value.clone());
-                                self.status = format!("Copied {algorithm}");
-                            }
-                            ui.add_space(6.0);
-                            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(&value).monospace().color(pal.text),
-                                    )
-                                    .selectable(true)
-                                    .wrap(),
-                                );
-                            });
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&result.value)
+                                        .monospace()
+                                        .size(12.0)
+                                        .color(pal.text),
+                                )
+                                .selectable(true)
+                                .wrap(),
+                            );
                         });
+                    }
+                    ui.add_space(5.0);
+                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .small_button(if self.secondary_hashes_open {
+                            format!("Hide other algorithms ({})", secondary.len())
+                        } else {
+                            format!("Other algorithms ({})", secondary.len())
+                        })
+                        .clicked()
+                    {
+                        self.secondary_hashes_open = !self.secondary_hashes_open;
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.small_button("Export").clicked() {
+                            self.export_results();
+                        }
+                        if ui.small_button("Copy all").clicked() {
+                            ui.ctx().copy_text(format_results(&ordered));
+                            self.status = "Copied all hashes".into();
+                        }
                     });
                 });
-            };
-
-            let response = if self.reorder_locked || ordered.len() <= 1 {
-                draw_row(ui, false);
-                None
-            } else {
-                Some(
-                    ui.dnd_drag_source(row_id, idx, |ui| draw_row(ui, true))
-                        .response,
-                )
-            };
-
-            // Draw an insertion line and capture a drop while something is hovering.
-            if let Some(response) = response
-                && let (Some(pointer), Some(_payload)) = (
-                    ui.input(|i| i.pointer.interact_pos()),
-                    response.dnd_hover_payload::<usize>(),
-                )
-            {
-                let rect = response.rect;
-                let stroke = Stroke::new(2.0, pal.accent);
-                let insert = if pointer.y < rect.center().y {
-                    ui.painter().hline(rect.x_range(), rect.top(), stroke);
-                    idx
-                } else {
-                    ui.painter().hline(rect.x_range(), rect.bottom(), stroke);
-                    idx + 1
-                };
-                if let Some(dragged) = response.dnd_release_payload::<usize>() {
-                    drag_from = Some(*dragged);
-                    drop_to = Some(insert);
-                }
-            }
-
-            ui.add_space(5.0);
-        }
-
-        if let (Some(from), Some(mut to)) = (drag_from, drop_to) {
-            if from < to {
-                to -= 1;
-            }
-            if from < self.order.len() {
-                let item = self.order.remove(from);
-                let to = to.min(self.order.len());
-                self.order.insert(to, item);
-                self.status = "Reordered hashes".into();
-            }
-        }
-
-        ui.add_space(1.0);
-        ui.horizontal(|ui| {
-            if ui.button("Copy all").clicked() {
-                ui.ctx().copy_text(format_results(&ordered));
-                self.status = "Copied all hashes".into();
-            }
-            if ui.button("Export").clicked() {
-                self.export_results();
             }
         });
     }
@@ -1539,6 +1828,78 @@ impl HasherApp {
         });
 
         ui.add_space(8.0);
+    }
+
+    fn forensic_summary(&self, ui: &mut egui::Ui, info: &FileInspection) {
+        let stored: Vec<&HashResult> = info
+            .embedded_hashes
+            .iter()
+            .chain(info.sidecar_hashes.iter())
+            .collect();
+        if stored.is_empty() {
+            return;
+        }
+        let comparable =
+            !self.file_is_logical_set || self.file_hash_mode == FileHashMode::EvidenceStream;
+        let matched = stored
+            .iter()
+            .filter(|stored| {
+                self.results.iter().any(|computed| {
+                    computed.algorithm == stored.algorithm && computed.value == stored.value
+                })
+            })
+            .count();
+        let mismatched = stored
+            .iter()
+            .filter(|stored| {
+                self.results.iter().any(|computed| {
+                    computed.algorithm == stored.algorithm && computed.value != stored.value
+                })
+            })
+            .count();
+        let (headline, detail, color) = if !comparable {
+            (
+                "Stored hashes found",
+                "Switch to Evidence stream and rehash to compare them with the reconstructed media."
+                    .to_owned(),
+                self.pal.warn,
+            )
+        } else if mismatched > 0 {
+            (
+                "✗ Stored hash mismatch",
+                format!(
+                    "{matched} matched and {mismatched} mismatched across {} detected segment(s).",
+                    info.segment_count
+                ),
+                self.pal.danger,
+            )
+        } else if matched > 0 {
+            (
+                "✓ Evidence verified",
+                format!(
+                    "All {matched} comparable stored hash value(s) match across {} detected segment(s).",
+                    info.segment_count
+                ),
+                self.pal.success,
+            )
+        } else {
+            (
+                "Stored hashes found",
+                "No stored value uses a currently computed algorithm.".to_owned(),
+                self.pal.warn,
+            )
+        };
+        ui.add_space(10.0);
+        Frame::new()
+            .fill(color.gamma_multiply(if self.pal.dark { 0.18 } else { 0.12 }))
+            .stroke(Stroke::new(1.0, color))
+            .corner_radius(CornerRadius::same(10))
+            .inner_margin(Margin::same(12))
+            .show(ui, |ui| {
+                ui.label(RichText::new(headline).size(16.0).strong().color(color));
+                ui.add_space(3.0);
+                ui.label(RichText::new(detail).size(12.0).color(self.pal.text_muted));
+            });
     }
 
     fn inspection_panel(&self, ui: &mut egui::Ui, info: &FileInspection) {
@@ -1669,6 +2030,23 @@ impl HasherApp {
                 );
                 ui.add_space(4.0);
                 for sidecar in &info.sidecar_hashes {
+                    let comparable = !self.file_is_logical_set
+                        || self.file_hash_mode == FileHashMode::EvidenceStream;
+                    let computed = self
+                        .results
+                        .iter()
+                        .find(|result| result.algorithm == sidecar.algorithm);
+                    let (comparison, color) = if !comparable {
+                        ("use evidence-stream mode", pal.text_muted)
+                    } else {
+                        match computed {
+                            Some(result) if result.value == sidecar.value => {
+                                ("✓ MATCH", pal.success)
+                            }
+                            Some(_) => ("✗ MISMATCH", pal.danger),
+                            None => ("not computed", pal.text_muted),
+                        }
+                    };
                     ui.horizontal(|ui| {
                         chip(pal, ui, &sidecar.algorithm.to_string(), pal.text_muted);
                         ui.add(
@@ -1681,6 +2059,9 @@ impl HasherApp {
                             .selectable(true)
                             .wrap(),
                         );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(RichText::new(comparison).strong().color(color));
+                        });
                     });
                     ui.add_space(3.0);
                 }
@@ -1695,13 +2076,26 @@ impl eframe::App for HasherApp {
         self.poll_work();
         self.poll_update_check();
         self.apply_appearance(&ctx);
-        if self.custom_chrome {
-            self.ensure_icon(&ctx);
-        }
+        self.ensure_icon(&ctx);
         let pal = self.pal;
 
         if self.custom_chrome {
             window_resize_handles(&ctx);
+        }
+
+        let open_shortcut = ctx.input_mut(|input| {
+            input.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::COMMAND,
+                egui::Key::O,
+            ))
+        });
+        if open_shortcut
+            && !self.working
+            && !self.verifying
+            && let Some(paths) = rfd::FileDialog::new().pick_files()
+        {
+            self.page = Page::File;
+            self.dispatch_paths(paths, ctx.clone());
         }
 
         let dropped: Vec<PathBuf> = ctx.input(|input| {
@@ -1713,8 +2107,14 @@ impl eframe::App for HasherApp {
                 .collect()
         });
         if !dropped.is_empty() && !self.working && !self.verifying {
-            self.page = Page::File;
-            self.dispatch_paths(dropped, ctx.clone());
+            if dropped.len() == 1 && looks_like_manifest(&dropped[0]) {
+                self.page = Page::Verify;
+                self.verify_input = VerifyInput::Manifest;
+                self.begin_manifest_verify(dropped[0].clone(), ctx.clone());
+            } else {
+                self.page = Page::File;
+                self.dispatch_paths(dropped, ctx.clone());
+            }
         }
 
         if self.custom_chrome {
@@ -1727,9 +2127,10 @@ impl eframe::App for HasherApp {
             ui.add_space(3.0);
             ui.horizontal(|ui| {
                 ui.add_space(4.0);
-                let problem = self.status.starts_with("Error")
-                    || self.status.contains("failed")
-                    || self.status.contains("MISMATCH");
+                let status_lower = self.status.to_ascii_lowercase();
+                let problem = status_lower.starts_with("error")
+                    || status_lower.contains("failed")
+                    || status_lower.contains("mismatch");
                 let (dot, state) = if self.working || self.verifying {
                     (pal.warn, "Working")
                 } else if problem {
@@ -1745,39 +2146,53 @@ impl eframe::App for HasherApp {
                 ));
                 ui.add_space(3.0);
                 ui.label(RichText::new(&self.status).size(11.5).color(pal.text_muted));
+                if matches!(self.page, Page::Text | Page::File) {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        chip(pal, ui, "Ctrl/Cmd O  Open files", pal.text_muted);
+                    });
+                }
             });
             ui.add_space(3.0);
         });
 
-        egui::Panel::left("navigation")
-            .resizable(false)
-            .default_size(148.0)
-            .show(root_ui, |ui| {
-                ui.add_space(8.0);
-
-                if nav_button(pal, ui, self.page == Page::Text, "Text & Numbers") {
-                    self.page = Page::Text;
-                }
-                if nav_button(pal, ui, self.page == Page::File, "Files & Images") {
-                    self.page = Page::File;
-                }
-                if nav_button(pal, ui, self.page == Page::Verify, "Verify") {
-                    self.page = Page::Verify;
-                }
-
-                // Settings pinned to the bottom.
-                ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-                    ui.add_space(4.0);
-                    if nav_button(pal, ui, self.page == Page::Settings, "Settings") {
-                        self.page = Page::Settings;
-                        if matches!(self.update_state, UpdateState::Idle) {
-                            self.begin_update_check(ctx.clone());
-                        }
-                    }
-                });
-            });
-
         egui::CentralPanel::default().show(root_ui, |ui| {
+            if matches!(self.page, Page::Verify | Page::Settings) {
+                Frame::new()
+                    .fill(pal.surface)
+                    .stroke(Stroke::new(1.0, pal.border))
+                    .inner_margin(Margin {
+                        left: 16,
+                        right: 16,
+                        top: 10,
+                        bottom: 10,
+                    })
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("SIGNAL")
+                                    .size(10.0)
+                                    .strong()
+                                    .color(pal.accent),
+                            );
+                            ui.add_space(8.0);
+                            if mode_button(pal, ui, self.page == Page::Text, "Text") {
+                                self.page = Page::Text;
+                            }
+                            if mode_button(pal, ui, self.page == Page::File, "Files") {
+                                self.page = Page::File;
+                            }
+                            if mode_button(pal, ui, self.page == Page::Verify, "Verify") {
+                                self.page = Page::Verify;
+                            }
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if mode_button(pal, ui, self.page == Page::Settings, "Settings") {
+                                    self.page = Page::Settings;
+                                }
+                            });
+                        });
+                    });
+            }
+
             egui::ScrollArea::vertical()
                 .auto_shrink([false; 2])
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
@@ -1790,7 +2205,7 @@ impl eframe::App for HasherApp {
                             bottom: 14,
                         })
                         .show(ui, |ui| match self.page {
-                            Page::Text => self.page_text(ui),
+                            Page::Text => self.page_text(ui, &ctx),
                             Page::File => self.page_file(ui, &ctx),
                             Page::Verify => self.page_verify(ui, &ctx),
                             Page::Settings => self.page_settings(ui),
@@ -1799,6 +2214,7 @@ impl eframe::App for HasherApp {
         });
 
         self.supported_formats_window(&ctx);
+        self.drop_overlay(&ctx);
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -1811,27 +2227,70 @@ impl eframe::App for HasherApp {
                 self.accent.a(),
             ],
             order: self.order.clone(),
-            reorder_locked: self.reorder_locked,
+            primary_algorithm: self.primary_algorithm,
         };
         eframe::set_value(storage, eframe::APP_KEY, &settings);
     }
 }
 
 impl HasherApp {
-    fn page_text(&mut self, ui: &mut egui::Ui) {
+    fn page_text(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let pal = self.pal;
-        section_header(
-            pal,
-            ui,
-            "Hash text or a number string",
-            "The exact UTF-8 bytes are hashed. No newline is added.",
-        );
-        let response = ui.add_sized(
-            [ui.available_width(), 86.0],
-            egui::TextEdit::multiline(&mut self.text)
-                .hint_text("Type or paste here…")
-                .font(egui::TextStyle::Monospace),
-        );
+        signal_backdrop(pal, ui);
+        ui.horizontal(|ui| {
+            if ui.small_button("Settings").clicked() {
+                self.page = Page::Settings;
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                chip(
+                    pal,
+                    ui,
+                    if self.working { "COMPUTING" } else { "READY" },
+                    if self.working { pal.warn } else { pal.success },
+                );
+            });
+        });
+        ui.add_space(14.0);
+        ui.vertical_centered(|ui| {
+            if let Some(texture) = &self.icon_texture {
+                let sized = egui::load::SizedTexture::new(texture.id(), texture.size_vec2());
+                ui.add(egui::Image::from_texture(sized).fit_to_exact_size(Vec2::splat(86.0)));
+            }
+            ui.add_space(4.0);
+            ui.label(RichText::new("Hasher").size(30.0).strong().color(pal.text));
+            ui.label(
+                RichText::new("Fast. Accurate. Verifiable.")
+                    .size(13.0)
+                    .color(pal.text_muted),
+            );
+        });
+        ui.add_space(18.0);
+        let response = signal_card(pal, ui, |ui| {
+            ui.horizontal(|ui| {
+                let (icon_rect, _) =
+                    ui.allocate_exact_size(Vec2::splat(22.0), egui::Sense::hover());
+                let painter = ui.painter();
+                painter.circle_stroke(
+                    icon_rect.center() - Vec2::new(2.0, 2.0),
+                    5.5,
+                    Stroke::new(1.5, pal.accent),
+                );
+                painter.line_segment(
+                    [
+                        icon_rect.center() + Vec2::new(2.0, 2.0),
+                        icon_rect.center() + Vec2::new(7.0, 7.0),
+                    ],
+                    Stroke::new(1.5, pal.accent),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.text)
+                        .hint_text("Type or paste the exact text to hash")
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(ui.available_width()),
+                )
+            })
+            .inner
+        });
         if response.changed() {
             if self.text.is_empty() {
                 self.results.clear();
@@ -1844,77 +2303,226 @@ impl HasherApp {
             }
         }
         ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            let button_count = 3.0;
+            let button_width = 82.0;
+            let spacing = ui.spacing().item_spacing.x;
+            let row_width = button_count * button_width + (button_count - 1.0) * spacing;
+            ui.add_space(((ui.available_width() - row_width) * 0.5).max(0.0));
+            mode_button(pal, ui, true, "Text");
+            if mode_button(pal, ui, false, "Files") {
+                self.page = Page::File;
+            }
+            if mode_button(pal, ui, false, "Verify") {
+                self.page = Page::Verify;
+            }
+        });
+        self.source_action_buttons(ui, ctx);
+
+        self.recent_jobs_panel(ui, ctx);
+        ui.add_space(14.0);
         if self.results_source == Some(ResultSource::Text) {
             self.result_table(ui);
-        } else {
-            ui.label(RichText::new("No results yet.").color(pal.text_muted));
         }
+    }
+
+    fn source_action_buttons(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let enabled = !self.working && !self.verifying;
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.add_space(((ui.available_width() - 330.0) * 0.5).max(0.0));
+            if ui
+                .add_enabled(enabled, egui::Button::new("Open files…"))
+                .clicked()
+                && let Some(paths) = rfd::FileDialog::new().pick_files()
+            {
+                self.page = Page::File;
+                self.dispatch_paths(paths, ctx.clone());
+            }
+            if ui
+                .add_enabled(enabled, egui::Button::new("Open folder…"))
+                .clicked()
+                && let Some(path) = rfd::FileDialog::new().pick_folder()
+            {
+                self.page = Page::File;
+                self.begin_folder_hash(path, ctx.clone());
+            }
+            if ui
+                .add_enabled(enabled, egui::Button::new("Open disk image…"))
+                .clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter(
+                        "Forensic images",
+                        &["e01", "ex01", "s01", "raw", "img", "dd", "001"],
+                    )
+                    .pick_file()
+            {
+                self.page = Page::File;
+                self.dispatch_paths(vec![path], ctx.clone());
+            }
+        });
+    }
+
+    fn recent_jobs_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let pal = self.pal;
+        ui.add_space(14.0);
+        ui.label(
+            RichText::new("Recent jobs")
+                .size(12.0)
+                .strong()
+                .color(pal.text),
+        );
+        ui.add_space(5.0);
+        card(pal, ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            if self.recent_jobs.is_empty() {
+                ui.label(
+                    RichText::new("No recent jobs yet")
+                        .size(12.0)
+                        .color(pal.text_muted),
+                );
+            }
+            let jobs = self.recent_jobs.clone();
+            for (index, job) in jobs.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    let (icon_rect, _) =
+                        ui.allocate_exact_size(Vec2::new(14.0, 16.0), egui::Sense::hover());
+                    ui.painter().rect_stroke(
+                        icon_rect.shrink(1.0),
+                        CornerRadius::same(2),
+                        Stroke::new(1.0, pal.text_muted),
+                        egui::StrokeKind::Inside,
+                    );
+                    ui.add_space(5.0);
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(&job.label).size(12.0).color(pal.text));
+                        ui.label(RichText::new(&job.detail).size(11.0).color(pal.text_muted));
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .add_enabled(
+                                !self.working && !self.verifying,
+                                egui::Button::new("Run again"),
+                            )
+                            .clicked()
+                        {
+                            self.replay_recent(job.action.clone(), ctx.clone());
+                        }
+                        chip(
+                            pal,
+                            ui,
+                            if job.successful { "DONE" } else { "ATTENTION" },
+                            if job.successful {
+                                pal.success
+                            } else {
+                                pal.danger
+                            },
+                        );
+                    });
+                });
+                if index + 1 < jobs.len() {
+                    ui.separator();
+                }
+            }
+        });
     }
 
     fn page_file(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let pal = self.pal;
-        section_header(
-            pal,
-            ui,
-            "Hash files, folders, or forensic containers",
-            "Choose files or a folder, or drag and drop them anywhere on the window.",
-        );
+        signal_backdrop(pal, ui);
+        ui.horizontal(|ui| {
+            if ui.small_button("Settings").clicked() {
+                self.page = Page::Settings;
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                chip(
+                    pal,
+                    ui,
+                    if self.working { "COMPUTING" } else { "READY" },
+                    if self.working { pal.warn } else { pal.success },
+                );
+            });
+        });
+        ui.add_space(14.0);
+        ui.vertical_centered(|ui| {
+            if let Some(texture) = &self.icon_texture {
+                let sized = egui::load::SizedTexture::new(texture.id(), texture.size_vec2());
+                ui.add(egui::Image::from_texture(sized).fit_to_exact_size(Vec2::splat(86.0)));
+            }
+            ui.add_space(4.0);
+            ui.label(RichText::new("Hasher").size(30.0).strong().color(pal.text));
+            ui.label(
+                RichText::new("Fast. Accurate. Verifiable.")
+                    .size(13.0)
+                    .color(pal.text_muted),
+            );
+        });
+        ui.add_space(18.0);
 
-        card(pal, ui, |ui| {
+        signal_card(pal, ui, |ui| {
             ui.horizontal(|ui| {
                 let mut shown = if self.batch.is_empty() {
                     self.file_path.clone()
                 } else {
                     format!("{} files", self.batch_pending.max(self.batch.len()))
                 };
+                let (icon_rect, _) =
+                    ui.allocate_exact_size(Vec2::splat(22.0), egui::Sense::hover());
+                ui.painter().circle_stroke(
+                    icon_rect.center() - Vec2::new(2.0, 2.0),
+                    5.5,
+                    Stroke::new(1.5, pal.accent),
+                );
+                ui.painter().line_segment(
+                    [
+                        icon_rect.center() + Vec2::new(2.0, 2.0),
+                        icon_rect.center() + Vec2::new(7.0, 7.0),
+                    ],
+                    Stroke::new(1.5, pal.accent),
+                );
                 ui.add_enabled(
                     false,
                     egui::TextEdit::singleline(&mut shown)
-                        .hint_text("No file selected")
-                        .desired_width(ui.available_width() - 210.0),
+                        .hint_text("Drop files here or use an Open button")
+                        .desired_width(ui.available_width()),
                 );
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui
-                        .add_enabled(
-                            !self.working && !self.verifying,
-                            egui::Button::new("Folder"),
-                        )
-                        .clicked()
-                        && let Some(path) = rfd::FileDialog::new().pick_folder()
-                    {
-                        self.begin_folder_hash(path, ctx.clone());
-                    }
-                    if ui
-                        .add_enabled(!self.working && !self.verifying, egui::Button::new("Files"))
-                        .clicked()
-                        && let Some(paths) = rfd::FileDialog::new().pick_files()
-                    {
-                        self.dispatch_paths(paths, ctx.clone());
-                    }
-                });
             });
         });
 
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            let button_count = 3.0;
+            let button_width = 82.0;
+            let spacing = ui.spacing().item_spacing.x;
+            let row_width = button_count * button_width + (button_count - 1.0) * spacing;
+            ui.add_space(((ui.available_width() - row_width) * 0.5).max(0.0));
+            if mode_button(pal, ui, false, "Text") {
+                self.page = Page::Text;
+            }
+            mode_button(pal, ui, true, "Files");
+            if mode_button(pal, ui, false, "Verify") {
+                self.page = Page::Verify;
+            }
+        });
+        self.source_action_buttons(ui, ctx);
+
         if self.batch.is_empty() && self.file_is_logical_set {
-            ui.add_space(8.0);
-            card(pal, ui, |ui| {
-                ui.label(RichText::new("Hash target").strong().color(pal.text));
-                ui.add_space(4.0);
-                ui.radio_value(
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.selectable_value(
                     &mut self.file_hash_mode,
                     FileHashMode::EvidenceStream,
-                    "Reconstructed evidence stream",
+                    "Evidence stream",
                 );
-                ui.radio_value(
+                ui.selectable_value(
                     &mut self.file_hash_mode,
                     FileHashMode::ContainerFile,
-                    "Selected segment file",
+                    "Container file",
                 );
-                ui.add_space(6.0);
                 if ui
                     .add_enabled(
                         !self.working && !self.verifying,
-                        egui::Button::new("Hash again"),
+                        egui::Button::new("Rehash"),
                     )
                     .clicked()
                 {
@@ -1933,22 +2541,25 @@ impl HasherApp {
         }
 
         if !self.batch.is_empty() {
-            ui.add_space(10.0);
+            self.recent_jobs_panel(ui, ctx);
+            ui.add_space(14.0);
             self.batch_table(ui);
             return;
         }
 
-        if let Some(info) = self.inspection.clone() {
-            ui.add_space(10.0);
-            self.inspection_panel(ui, &info);
-        }
-
-        ui.add_space(10.0);
         if self.results_source == Some(ResultSource::File) {
             self.result_table(ui);
-        } else {
-            ui.label(RichText::new("No results yet.").color(pal.text_muted));
         }
+
+        if let Some(info) = self.inspection.clone() {
+            self.forensic_summary(ui, &info);
+            ui.add_space(10.0);
+            egui::CollapsingHeader::new(
+                RichText::new("File and forensic details").color(pal.text_muted),
+            )
+            .show(ui, |ui| self.inspection_panel(ui, &info));
+        }
+        self.recent_jobs_panel(ui, ctx);
     }
 
     fn batch_table(&mut self, ui: &mut egui::Ui) {
@@ -2061,88 +2672,109 @@ impl HasherApp {
         section_header(
             pal,
             ui,
-            "Verify a hash",
-            "Compute a hash from text or a file and compare it against a value you trust.",
+            "Trust, but verify",
+            "Compare text or files with a trusted hash, or check a complete checksum manifest.",
         );
 
-        // 1 — the expected hash, typed or imported.
-        card(pal, ui, |ui| {
-            ui.label(RichText::new("Expected hash").strong().color(pal.text));
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.verify_expected)
-                        .hint_text("Paste the hash to check against")
-                        .font(egui::TextStyle::Monospace)
-                        .desired_width(ui.available_width() - 100.0),
-                );
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button("Import").clicked()
-                        && let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Hash list", &["txt", "log"])
-                            .pick_file()
-                    {
-                        match read_hash_list(&path) {
-                            Ok(values) if !values.is_empty() => {
-                                self.verify_expected = if values[0].algorithm == Algorithm::Crc32 {
-                                    format!("CRC32: {}", values[0].value)
-                                } else {
-                                    values[0].value.clone()
-                                };
-                                self.status = if values.len() > 1 {
-                                    format!("Imported the first of {} hash values", values.len())
-                                } else {
-                                    "Imported hash value".into()
-                                };
-                            }
-                            Ok(_) => self.status = "No hash values found in that file".into(),
-                            Err(error) => self.status = format!("Import failed: {error:#}"),
-                        }
-                    }
-                });
-            });
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.verify_input, VerifyInput::Text, "Text / Number");
+            ui.selectable_value(&mut self.verify_input, VerifyInput::File, "Single file");
+            ui.selectable_value(&mut self.verify_input, VerifyInput::Manifest, "Manifest");
+        });
+        ui.add_space(8.0);
 
-            ui.add_space(4.0);
-            let cleaned = normalise_expected_hash(&self.verify_expected);
-            if !cleaned.is_empty() {
-                let detected = detect_expected_algorithm(&self.verify_expected);
-                if let Some(algorithm) = detected {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("Detected").size(11.0).color(pal.text_muted));
-                        ui.add_space(2.0);
-                        chip(pal, ui, &algorithm.to_string(), pal.accent);
+        // 1 — the expected hash, typed or imported.
+        if self.verify_input != VerifyInput::Manifest {
+            signal_card(pal, ui, |ui| {
+                ui.label(
+                    RichText::new("TRUSTED SIGNAL")
+                        .size(10.0)
+                        .strong()
+                        .color(SIGNAL_VIOLET),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.verify_expected)
+                            .hint_text("Paste the hash to check against")
+                            .font(egui::TextStyle::Monospace)
+                            .desired_width(ui.available_width() - 100.0),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button("Import").clicked()
+                            && let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Hash list", &["txt", "log"])
+                                .pick_file()
+                        {
+                            match read_hash_list(&path) {
+                                Ok(values) if !values.is_empty() => {
+                                    self.verify_expected =
+                                        if values[0].algorithm == Algorithm::Crc32 {
+                                            format!("CRC32: {}", values[0].value)
+                                        } else {
+                                            values[0].value.clone()
+                                        };
+                                    self.status = if values.len() > 1 {
+                                        format!(
+                                            "Imported the first of {} hash values",
+                                            values.len()
+                                        )
+                                    } else {
+                                        "Imported hash value".into()
+                                    };
+                                }
+                                Ok(_) => self.status = "No hash values found in that file".into(),
+                                Err(error) => self.status = format!("Import failed: {error:#}"),
+                            }
+                        }
                     });
-                    if algorithm == Algorithm::Adler32 {
-                        ui.label(
+                });
+
+                ui.add_space(4.0);
+                let cleaned = normalise_expected_hash(&self.verify_expected);
+                if !cleaned.is_empty() {
+                    let detected = detect_expected_algorithm(&self.verify_expected);
+                    if let Some(algorithm) = detected {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Detected").size(11.0).color(pal.text_muted));
+                            ui.add_space(2.0);
+                            chip(pal, ui, &algorithm.to_string(), pal.accent);
+                        });
+                        if algorithm == Algorithm::Adler32 {
+                            ui.label(
                             RichText::new(
                                 "Unlabelled 8-hex values are treated as ADLER32; prefix CRC32 values with \"CRC32:\".",
                             )
                             .size(11.0)
                             .color(pal.text_muted),
                         );
+                        }
+                    } else {
+                        ui.label(
+                            RichText::new(
+                                "Unrecognised hash — expected 8, 32, 40 or 64 hex characters.",
+                            )
+                            .size(11.0)
+                            .color(pal.warn),
+                        );
                     }
-                } else {
-                    ui.label(
-                        RichText::new(
-                            "Unrecognised hash — expected 8, 32, 40 or 64 hex characters.",
-                        )
-                        .size(11.0)
-                        .color(pal.warn),
-                    );
                 }
-            }
-        });
+            });
+        }
 
         ui.add_space(8.0);
 
         // 2 — the input to hash: text or a file.
         card(pal, ui, |ui| {
-            ui.label(RichText::new("Input to hash").strong().color(pal.text));
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.radio_value(&mut self.verify_input, VerifyInput::Text, "Text / Number");
-                ui.radio_value(&mut self.verify_input, VerifyInput::File, "File");
-            });
+            ui.label(
+                RichText::new(if self.verify_input == VerifyInput::Manifest {
+                    "Checksum manifest"
+                } else {
+                    "Input to hash"
+                })
+                .strong()
+                .color(pal.text),
+            );
             ui.add_space(6.0);
             match self.verify_input {
                 VerifyInput::Text => {
@@ -2175,6 +2807,40 @@ impl HasherApp {
                         });
                     });
                 }
+                VerifyInput::Manifest => {
+                    ui.horizontal(|ui| {
+                        ui.add_enabled(
+                            false,
+                            egui::TextEdit::singleline(&mut self.verify_manifest)
+                                .hint_text("Choose or drop a GNU, BSD, SHA256SUMS, or SFV manifest")
+                                .desired_width(ui.available_width() - 100.0),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui
+                                .add_enabled(
+                                    !self.verifying && !self.working,
+                                    egui::Button::new("Choose"),
+                                )
+                                .clicked()
+                                && let Some(path) = rfd::FileDialog::new()
+                                    .add_filter(
+                                        "Checksum manifests",
+                                        &["txt", "sfv", "sha1", "sha256", "md5"],
+                                    )
+                                    .pick_file()
+                            {
+                                self.verify_manifest = path.display().to_string();
+                                self.manifest_results.clear();
+                            }
+                        });
+                    });
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("Relative entries are resolved from the manifest's folder.")
+                            .size(11.0)
+                            .color(pal.text_muted),
+                    );
+                }
             }
         });
 
@@ -2201,6 +2867,16 @@ impl HasherApp {
                             self.begin_verify_file(PathBuf::from(&self.verify_file), ctx.clone());
                         }
                     }
+                    VerifyInput::Manifest => {
+                        if self.verify_manifest.is_empty() {
+                            self.status = "Choose a checksum manifest first".into();
+                        } else {
+                            self.begin_manifest_verify(
+                                PathBuf::from(&self.verify_manifest),
+                                ctx.clone(),
+                            );
+                        }
+                    }
                 }
             }
             if self.verifying {
@@ -2210,9 +2886,98 @@ impl HasherApp {
         });
 
         // 4 — the verdict.
-        if let Some(report) = self.verify_report.clone() {
+        if self.verify_input != VerifyInput::Manifest
+            && let Some(report) = self.verify_report.clone()
+        {
             ui.add_space(10.0);
             self.verify_banner(ui, &report);
+        }
+        if self.verify_input == VerifyInput::Manifest && !self.manifest_results.is_empty() {
+            ui.add_space(10.0);
+            self.manifest_results_panel(ui);
+        }
+        self.recent_jobs_panel(ui, ctx);
+    }
+
+    fn manifest_results_panel(&self, ui: &mut egui::Ui) {
+        let pal = self.pal;
+        let matched = self
+            .manifest_results
+            .iter()
+            .filter(|entry| entry.matches())
+            .count();
+        let errors = self
+            .manifest_results
+            .iter()
+            .filter(|entry| entry.error.is_some())
+            .count();
+        let mismatched = self.manifest_results.len().saturating_sub(matched + errors);
+        let (headline, color) = if mismatched == 0 && errors == 0 {
+            ("✓ MANIFEST VERIFIED", pal.success)
+        } else {
+            ("✗ MANIFEST HAS PROBLEMS", pal.danger)
+        };
+        Frame::new()
+            .fill(color.gamma_multiply(if pal.dark { 0.18 } else { 0.12 }))
+            .stroke(Stroke::new(1.0, color))
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(Margin::same(12))
+            .show(ui, |ui| {
+                ui.label(RichText::new(headline).size(16.0).strong().color(color));
+                ui.label(
+                    RichText::new(format!(
+                        "{matched} matched · {mismatched} mismatched · {errors} errors"
+                    ))
+                    .color(pal.text_muted),
+                );
+            });
+        ui.add_space(8.0);
+        for entry in &self.manifest_results {
+            let (label, color) = if entry.error.is_some() {
+                ("ERROR", pal.warn)
+            } else if entry.matches() {
+                ("MATCH", pal.success)
+            } else {
+                ("MISMATCH", pal.danger)
+            };
+            card(pal, ui, |ui| {
+                ui.horizontal(|ui| {
+                    chip(pal, ui, label, color);
+                    ui.label(
+                        RichText::new(entry.path.display().to_string())
+                            .strong()
+                            .color(pal.text),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        chip(
+                            pal,
+                            ui,
+                            &entry.expected.algorithm.to_string(),
+                            pal.text_muted,
+                        );
+                    });
+                });
+                if let Some(error) = &entry.error {
+                    ui.label(RichText::new(error).size(11.5).color(pal.warn));
+                } else if !entry.matches() {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("Expected").size(11.0).color(pal.text_muted));
+                    ui.add(
+                        egui::Label::new(RichText::new(&entry.expected.value).monospace())
+                            .selectable(true)
+                            .wrap(),
+                    );
+                    if let Some(computed) = &entry.computed {
+                        ui.label(RichText::new("Computed").size(11.0).color(pal.text_muted));
+                        ui.add(
+                            egui::Label::new(RichText::new(computed).monospace())
+                                .selectable(true)
+                                .wrap(),
+                        );
+                    }
+                }
+            });
+            ui.add_space(6.0);
         }
     }
 
@@ -2320,11 +3085,52 @@ impl HasherApp {
                     .strong()
                     .color(pal.text),
             );
-            ui.add_space(4.0);
-            ui.checkbox(&mut self.reorder_locked, "Lock reorder");
             ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Primary result").color(pal.text_muted));
+                egui::ComboBox::from_id_salt("primary-algorithm")
+                    .selected_text(self.primary_algorithm.to_string())
+                    .show_ui(ui, |ui| {
+                        for algorithm in Algorithm::ALL {
+                            ui.selectable_value(
+                                &mut self.primary_algorithm,
+                                algorithm,
+                                algorithm.to_string(),
+                            );
+                        }
+                    });
+            });
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("Display order for the remaining results")
+                    .size(11.5)
+                    .color(pal.text_muted),
+            );
+            let order = self.order.clone();
+            for (index, algorithm) in order.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(algorithm.to_string())
+                            .monospace()
+                            .color(pal.text),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .add_enabled(index + 1 < order.len(), egui::Button::new("Down"))
+                            .clicked()
+                        {
+                            self.order.swap(index, index + 1);
+                        }
+                        if ui.add_enabled(index > 0, egui::Button::new("Up")).clicked() {
+                            self.order.swap(index, index - 1);
+                        }
+                    });
+                });
+            }
+            ui.add_space(4.0);
             if ui.button("Reset to default order").clicked() {
                 self.order = Algorithm::ALL.to_vec();
+                self.primary_algorithm = Algorithm::Sha256;
                 self.status = "Hash order reset".into();
             }
         });
@@ -2380,6 +3186,12 @@ impl HasherApp {
                 }
             }
             ui.add_space(8.0);
+            ui.label(
+                RichText::new("Hasher only connects to GitHub when you press Check now.")
+                    .size(11.0)
+                    .color(pal.text_muted),
+            );
+            ui.add_space(4.0);
             let checking = matches!(self.update_state, UpdateState::Checking);
             if ui
                 .add_enabled(!checking, egui::Button::new("Check now"))
@@ -2494,6 +3306,52 @@ impl HasherApp {
                 );
             });
     }
+
+    fn drop_overlay(&self, ctx: &egui::Context) {
+        let hovered = ctx.input(|input| input.raw.hovered_files.clone());
+        if hovered.is_empty() {
+            return;
+        }
+        let manifest =
+            hovered.len() == 1 && hovered[0].path.as_deref().is_some_and(looks_like_manifest);
+        egui::Area::new(egui::Id::new("drop-overlay"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                Frame::new()
+                    .fill(self.pal.surface)
+                    .stroke(Stroke::new(2.0, self.pal.accent))
+                    .corner_radius(CornerRadius::same(14))
+                    .inner_margin(Margin::symmetric(28, 22))
+                    .shadow(Shadow {
+                        offset: [0, 8],
+                        blur: 24,
+                        spread: 2,
+                        color: Color32::from_black_alpha(100),
+                    })
+                    .show(ui, |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                RichText::new(if manifest {
+                                    "Drop to verify this manifest"
+                                } else if hovered.len() == 1 {
+                                    "Drop to hash this file"
+                                } else {
+                                    "Drop to hash these files"
+                                })
+                                .size(18.0)
+                                .strong()
+                                .color(self.pal.text),
+                            );
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new(format!("{} item(s)", hovered.len()))
+                                    .color(self.pal.text_muted),
+                            );
+                        });
+                    });
+            });
+    }
 }
 
 fn supported_format_row(
@@ -2573,7 +3431,7 @@ fn main() -> eframe::Result {
                 if !saved.order.is_empty() {
                     app.order = saved.order;
                 }
-                app.reorder_locked = saved.reorder_locked;
+                app.primary_algorithm = saved.primary_algorithm;
                 app.style_key = None;
             }
             Ok(Box::new(app))
@@ -2596,5 +3454,29 @@ mod tests {
     fn compares_missing_patch_as_zero() {
         assert_eq!(compare_versions("1.2", "1.2.0"), Ordering::Equal);
         assert_eq!(compare_versions("1.2.1", "1.2"), Ordering::Greater);
+    }
+
+    #[test]
+    fn recognises_common_manifest_names() {
+        assert!(looks_like_manifest(Path::new("SHA256SUMS")));
+        assert!(looks_like_manifest(Path::new("checksums.txt")));
+        assert!(looks_like_manifest(Path::new("archive.sfv")));
+        assert!(!looks_like_manifest(Path::new("notes.txt")));
+    }
+
+    #[test]
+    fn manifest_entry_reports_a_match_only_for_equal_values() {
+        let mut entry = ManifestCheckEntry {
+            path: PathBuf::from("evidence.bin"),
+            expected: HashResult {
+                algorithm: Algorithm::Sha256,
+                value: "abc".into(),
+            },
+            computed: Some("abc".into()),
+            error: None,
+        };
+        assert!(entry.matches());
+        entry.computed = Some("def".into());
+        assert!(!entry.matches());
     }
 }
