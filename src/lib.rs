@@ -7,7 +7,7 @@ use adler2::Adler32;
 use anyhow::{Context, Result, bail};
 use md5::Md5;
 use sha1::Sha1;
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 use std::{
     fmt::{self, Display},
     fs::{self, File},
@@ -21,15 +21,19 @@ pub enum Algorithm {
     Md5,
     Sha1,
     Sha256,
+    Sha512,
+    Blake3,
     Crc32,
 }
 
 impl Algorithm {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 7] = [
         Self::Adler32,
         Self::Md5,
         Self::Sha1,
         Self::Sha256,
+        Self::Sha512,
+        Self::Blake3,
         Self::Crc32,
     ];
 
@@ -39,6 +43,8 @@ impl Algorithm {
             "md5" => Ok(Self::Md5),
             "sha1" => Ok(Self::Sha1),
             "sha256" => Ok(Self::Sha256),
+            "sha512" => Ok(Self::Sha512),
+            "blake3" => Ok(Self::Blake3),
             "crc32" => Ok(Self::Crc32),
             _ => bail!("unsupported algorithm: {value}"),
         }
@@ -49,7 +55,8 @@ impl Algorithm {
             Self::Adler32 | Self::Crc32 => 8,
             Self::Md5 => 32,
             Self::Sha1 => 40,
-            Self::Sha256 => 64,
+            Self::Sha256 | Self::Blake3 => 64,
+            Self::Sha512 => 128,
         }
     }
 }
@@ -61,6 +68,8 @@ impl Display for Algorithm {
             Self::Md5 => "MD5",
             Self::Sha1 => "SHA-1",
             Self::Sha256 => "SHA-256",
+            Self::Sha512 => "SHA-512",
+            Self::Blake3 => "BLAKE3",
             Self::Crc32 => "CRC32",
         })
     }
@@ -77,6 +86,8 @@ struct MultiHasher {
     md5: Md5,
     sha1: Sha1,
     sha256: Sha256,
+    sha512: Sha512,
+    blake3: blake3::Hasher,
     crc32: u32,
 }
 
@@ -109,6 +120,8 @@ impl MultiHasher {
             md5: Md5::new(),
             sha1: Sha1::new(),
             sha256: Sha256::new(),
+            sha512: Sha512::new(),
+            blake3: blake3::Hasher::new(),
             crc32: u32::MAX,
         }
     }
@@ -118,6 +131,8 @@ impl MultiHasher {
         self.md5.update(bytes);
         self.sha1.update(bytes);
         self.sha256.update(bytes);
+        self.sha512.update(bytes);
+        self.blake3.update(bytes);
         for byte in bytes {
             let index = ((self.crc32 ^ u32::from(*byte)) & 0xff) as usize;
             self.crc32 = CRC32_TABLE[index] ^ (self.crc32 >> 8);
@@ -141,6 +156,14 @@ impl MultiHasher {
             HashResult {
                 algorithm: Algorithm::Sha256,
                 value: hex::encode(self.sha256.finalize()),
+            },
+            HashResult {
+                algorithm: Algorithm::Sha512,
+                value: hex::encode(self.sha512.finalize()),
+            },
+            HashResult {
+                algorithm: Algorithm::Blake3,
+                value: self.blake3.finalize().to_hex().to_string(),
             },
             HashResult {
                 algorithm: Algorithm::Crc32,
@@ -297,6 +320,7 @@ fn algorithm_from_digest(value: &str) -> Option<Algorithm> {
         32 => Some(Algorithm::Md5),
         40 => Some(Algorithm::Sha1),
         64 => Some(Algorithm::Sha256),
+        128 => Some(Algorithm::Sha512),
         _ => None,
     }
 }
@@ -464,8 +488,9 @@ pub struct VerifyReport {
     pub note: String,
 }
 
-/// Normalise an expected-hash string, pick the algorithm by length, and compare
-/// against the computed set.
+/// Normalise an expected-hash string, pick the algorithm by label/length, and
+/// compare against the computed set. Unlabelled 64-character hashes default to
+/// SHA-256 because BLAKE3 uses the same digest length.
 pub fn normalise_expected_hash(expected_raw: &str) -> String {
     let expected_raw = strip_algorithm_label(expected_raw);
     let compact: String = expected_raw
@@ -517,6 +542,9 @@ fn explicit_algorithm_label(value: &str) -> Option<Algorithm> {
         ("sha-1", Algorithm::Sha1),
         ("sha256", Algorithm::Sha256),
         ("sha-256", Algorithm::Sha256),
+        ("sha512", Algorithm::Sha512),
+        ("sha-512", Algorithm::Sha512),
+        ("blake3", Algorithm::Blake3),
     ] {
         let Some(prefix) = trimmed.get(..label.len()) else {
             continue;
@@ -536,6 +564,7 @@ fn strip_algorithm_label(value: &str) -> &str {
     let trimmed = value.trim_start();
     for label in [
         "adler32", "adler-32", "crc32", "crc-32", "md5", "sha1", "sha-1", "sha256", "sha-256",
+        "sha512", "sha-512", "blake3",
     ] {
         let Some(prefix) = trimmed.get(..label.len()) else {
             continue;
@@ -578,13 +607,23 @@ pub fn build_report(expected_raw: &str, computed_set: &[HashResult]) -> VerifyRe
         return report;
     }
 
-    let Some(algorithm) = detect_expected_algorithm(expected_raw) else {
+    let Some(mut algorithm) = detect_expected_algorithm(expected_raw) else {
         report.note = format!(
-            "{} hex characters doesn't match ADLER32/CRC32 (8), MD5 (32), SHA-1 (40) or SHA-256 (64).",
+            "{} hex characters doesn't match ADLER32/CRC32 (8), MD5 (32), SHA-1 (40), SHA-256/BLAKE3 (64) or SHA-512 (128).",
             expected.len()
         );
         return report;
     };
+    // SHA-256 and BLAKE3 are both 64 hexadecimal characters. When no label was
+    // supplied, accept whichever computed digest actually matches; SHA-256
+    // remains the conventional fallback for reporting a mismatch.
+    if explicit_algorithm_label(expected_raw).is_none()
+        && let Some(matching) = computed_set
+            .iter()
+            .find(|hash| hash.value == expected && hash.algorithm.hex_len() == expected.len())
+    {
+        algorithm = matching.algorithm;
+    }
     report.algorithm = Some(algorithm);
 
     let computed = computed_set
@@ -1027,6 +1066,7 @@ pub fn extract_hashes(text: &str) -> Vec<HashResult> {
             32 => Some(Algorithm::Md5),
             40 => Some(Algorithm::Sha1),
             64 => Some(Algorithm::Sha256),
+            128 => Some(Algorithm::Sha512),
             _ => None,
         };
         if let Some(algorithm) = algorithm {
@@ -1087,7 +1127,15 @@ mod tests {
             got[3].value,
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
-        assert_eq!(got[4].value, "352441c2");
+        assert_eq!(
+            got[4].value,
+            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+        );
+        assert_eq!(
+            got[5].value,
+            "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"
+        );
+        assert_eq!(got[6].value, "352441c2");
     }
 
     #[test]
@@ -1231,6 +1279,18 @@ mod tests {
 
         let mismatch = build_report(&"0".repeat(32), &computed);
         assert_eq!(mismatch.outcome, VerifyOutcome::Mismatch);
+    }
+
+    #[test]
+    fn verifies_labelled_and_bare_blake3_hashes() {
+        let computed = hash_bytes(b"abc");
+        let digest = "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85";
+
+        for expected in [digest.to_owned(), format!("BLAKE3: {digest}")] {
+            let report = build_report(&expected, &computed);
+            assert_eq!(report.outcome, VerifyOutcome::Match);
+            assert_eq!(report.algorithm, Some(Algorithm::Blake3));
+        }
     }
 
     #[test]

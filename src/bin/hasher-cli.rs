@@ -78,7 +78,7 @@ enum Command {
     /// Compare an expected hash against a file or text. Exits 1 on mismatch,
     /// 2 when the expected value or input is unusable.
     Verify {
-        /// The trusted hash to check against (ADLER32, CRC32, MD5, SHA-1 or SHA-256).
+        /// The trusted hash to check against (ADLER32, CRC32, MD5, SHA-1, SHA-256, SHA-512 or BLAKE3).
         expected: String,
         /// Hash this file (raw or EWF/E01) and compare.
         #[arg(short, long, conflicts_with = "text")]

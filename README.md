@@ -10,11 +10,11 @@ connection after installation.
 
 ## Features
 
-- ADLER32, CRC32, MD5, SHA-1, and SHA-256 in a single pass
+- ADLER32, CRC32, MD5, SHA-1, SHA-256, SHA-512, and BLAKE3 in a single pass
 - Exact UTF-8 text and number-string hashing
 - Buffered, cancellable background hashing with recursive folder support
 - GNU/coreutils, BSD checksum, `SHA256SUMS`, and SFV-style manifest creation and verification
-- Theme, accent, and hash-row order remembered between runs
+- Matching dark and light themes, with the preference remembered between runs
 - `.txt` and `.log` hash-value import and export
 - `.dd`, `.img`, `.raw`, numbered raw segments (`.001`, etc.), and EWF
   (`.E01`, `.Ex01`, `.L01`, `.Lx01`) identification
@@ -22,9 +22,9 @@ connection after installation.
 - Embedded EWF MD5/SHA-1 acquisition-digest and case-metadata extraction
 - Explicit MATCH/MISMATCH comparison of stored and reconstructed-media hashes
 - Drag-and-drop manifest verification with per-file match, mismatch, and error results
-- Actionable recent jobs for quickly repeating hashes and verification checks
+- Session history for completed hashes and verification checks
 - Acquisition read-error reporting and optional compressed container-segment hashing
-- System, dark, and light themes with an editable accent colour
+- A queue-based desktop interface with live progress and a file detail inspector
 - JetBrains Mono embedded in the executable
 - Separate `hasher-cli` executable
 
@@ -54,15 +54,9 @@ and therefore requires `--algorithm crc32`. `--check`
 auto-detects all supported manifest line formats, resolves relative entries from
 the manifest's directory (or `--base`), and exits `1` if any entry fails.
 
-For laggy virtual machines, the GUI now uses native OS window chrome by default
-because it is much cheaper to move and resize than the custom frameless window.
-Set `HASHER_CUSTOM_CHROME=1` to restore the old custom title bar. If the virtual
-GPU is still unhappy, try `HASHER_RENDERER=glow cargo run --bin hasher` or
-`HASHER_RENDERER=wgpu cargo run --bin hasher`; `HASHER_SOFTWARE_RENDERER=1` is
-also available for the OpenGL backend on platforms that support it.
-
 Algorithm names accepted by `--algorithm` are `all`, `adler32`, `crc32`, `md5`,
-`sha1`, and `sha256`. CLI output is written to stdout and errors to stderr.
+`sha1`, `sha256`, `sha512`, and `blake3`. CLI output is written to stdout and
+errors to stderr.
 
 ## Build and package
 
@@ -108,7 +102,7 @@ is a segmented, compressed Expert Witness container. Hasher keeps these concepts
   hash/digest section. Hasher extracts stored MD5 and SHA-1 values when present.
 - **Evidence-stream hash:** hashes the decompressed/reconstructed media across the
   complete discovered EWF segment set. Hasher computes ADLER32, CRC32, MD5,
-  SHA-1 and SHA-256 over that logical stream in one pass.
+  SHA-1, SHA-256, SHA-512 and BLAKE3 over that logical stream in one pass.
 - **Numbered raw-stream hash:** hashes `.001` onward as one logical stream.
   Hasher refuses reconstruction when `.001` or an intermediate segment is
   missing, while selected-file mode remains available for hashing one segment.
