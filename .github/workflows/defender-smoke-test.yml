@@ -62,7 +62,7 @@ jobs:
           Get-FileHash -Algorithm SHA256 dist\windows\*.zip,dist\windows\*.exe | Sort-Object Path | ForEach-Object { "$($_.Hash.ToLowerInvariant())  $([IO.Path]::GetFileName($_.Path))" } | Add-Content dist\windows\defender-smoke-test-report.txt -Encoding UTF8
           Get-Content dist\windows\defender-smoke-test-report.txt
       - name: Upload scanned smoke-test artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: Hasher-Windows-Defender-smoke-test
           path: |
