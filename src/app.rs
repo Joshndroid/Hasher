@@ -1211,30 +1211,30 @@ fn file_row(
                     [SELECT_COLUMN_WIDTH, 36.0],
                     egui::Checkbox::without_text(&mut entry.selected),
                 );
-                for index in 0..5 {
+                for (index, width) in widths.into_iter().enumerate() {
                     match index {
                         0 => {
-                            let name = file_cell(ui, widths[index], &file_name(&entry.path));
+                            let name = file_cell(ui, width, &file_name(&entry.path));
                             clicked |= name.clicked();
                         }
                         1 => {
-                            label_cell(ui, widths[index], format_bytes(entry.size));
+                            label_cell(ui, width, format_bytes(entry.size));
                         }
                         2 => {
-                            label_cell(ui, widths[index], entry.algorithm.to_string());
+                            label_cell(ui, width, entry.algorithm.to_string());
                         }
                         3 => match &entry.status {
                             Status::Hashing => {
-                                label_cell(ui, widths[index], "Hashing");
+                                label_cell(ui, width, "Hashing");
                             }
                             Status::Complete => {
-                                status_cell(ui, widths[index], "Complete", GREEN);
+                                status_cell(ui, width, "Complete", GREEN);
                             }
                             Status::Failed(error) => {
-                                status_cell(ui, widths[index], "Failed", RED).on_hover_text(error);
+                                status_cell(ui, width, "Failed", RED).on_hover_text(error);
                             }
                         },
-                        4 => progress_cell(ui, widths[index], entry.progress),
+                        4 => progress_cell(ui, width, entry.progress),
                         _ => unreachable!(),
                     }
                     if index < 4 {
@@ -1454,7 +1454,7 @@ fn history_row(ui: &mut egui::Ui, item: &HistoryItem, index: usize, dark: bool) 
     };
     let mut copy = false;
     Frame::new()
-        .fill(if index % 2 == 0 {
+        .fill(if index.is_multiple_of(2) {
             ui.visuals()
                 .faint_bg_color
                 .linear_multiply(if dark { 0.35 } else { 0.55 })
